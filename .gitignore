@@ -1,0 +1,22 @@
+# Python cache / compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+*.log.*
+*.gz
+
+# CSV history files
+voltage_history.csv
+voltage_history.csv.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Virtual environment
+venv/
+.env/

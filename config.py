@@ -108,6 +108,10 @@ EMAIL_CRITICAL_VOLTAGE_THRESHOLD = 20.8  # Send urgent email below 20.8V
 EMAIL_RECOVERY_VOLTAGE_THRESHOLD = 21.5  # Send recovery email when voltage recovers above 21.5V
 EMAIL_CRITICAL_HIGH_VOLTAGE_THRESHOLD = 25.0  # Send critical alert above 25.0V
 
+# Communication failure thresholds
+COMM_FAILURE_ALERT_MINUTES = 10      # Alert after 10 minutes of failed voltage reads
+COMM_FAILURE_CRITICAL_MINUTES = 30   # Critical alert after 30 minutes of failed reads
+
 # Email Configuration (you'll need to set these up)
 SMTP_SERVER = "smtp.gmail.com"           # Gmail SMTP server
 SMTP_PORT = 587                          # Gmail SMTP port

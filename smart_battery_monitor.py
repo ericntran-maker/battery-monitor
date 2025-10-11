@@ -1,0 +1,1092 @@
+#!/usr/bin/env python3
+"""
+Smart Battery Monitor with Time-of-Day Optimization
+Monitors 6S battery voltage and controls charger relay based on:
+1. Safety voltage thresholds
+2. Time-of-day electricity costs (optimized for your TOD rates)
+3. Solar panel availability detection
+"""
+
+import RPi.GPIO as GPIO
+import serial
+import time
+import logging
+import csv
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, time as dt_time, timedelta
+from collections import deque
+import os
+
+# Import configuration
+from config import *
+
+class SmartBatteryMonitor:
+    def __init__(self):
+        self.setup_logging()
+        self.setup_gpio()
+        self.setup_serial()
+        
+        # State tracking
+        self.charger_connected = True
+        self.last_voltage = 0.0
+        self.voltage_history = deque(maxlen=int(SOLAR_DETECTION_WINDOW / MONITOR_INTERVAL))
+        self.last_detailed_log = 0
+        self.solar_detected = False
+        
+        # Email notification tracking
+        self.last_email_alert = None
+        self.last_email_critical = None
+        self.last_email_recovery = None
+        self.last_email_high_voltage = None
+        self.last_email_critical_high = None
+        self.voltage_alert_sent = False
+        self.voltage_critical_sent = False
+        self.voltage_high_sent = False
+        self.voltage_critical_high_sent = False
+        
+        # CSV logging setup
+        if ENABLE_CSV_LOGGING:
+            self.setup_csv_logging()
+            
+    def setup_logging(self):
+        """Initialize logging system"""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(LOG_FILE),
+                logging.StreamHandler()
+            ]
+        )
+        
+    def setup_csv_logging(self):
+        """Setup CSV logging for voltage history"""
+        if not os.path.exists(VOLTAGE_LOG_FILE):
+            with open(VOLTAGE_LOG_FILE, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow([
+                    'timestamp', 'voltage', 'charger_connected', 'solar_detected',
+                    'in_preferred_hours', 'in_avoid_hours', 'charging_decision',
+                    'rate_type', 'current_rate_cents', 'has_ev_credit', 'season', 'is_weekend'
+                ])
+                
+    def log_to_csv(self, voltage, charging_decision):
+        """Log data to CSV file with rate information"""
+        if not ENABLE_CSV_LOGGING:
+            return
+            
+        try:
+            rate_type, current_rate, has_ev_credit = self.get_current_rate_info()
+            
+            with open(VOLTAGE_LOG_FILE, 'a', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    f"{voltage:.3f}",
+                    self.charger_connected,
+                    self.solar_detected,
+                    self.is_preferred_charging_time(),
+                    self.is_avoid_charging_time(),
+                    charging_decision,
+                    rate_type,
+                    f"{current_rate:.2f}",
+                    has_ev_credit,
+                    self.get_current_season(),
+                    self.is_weekend_or_holiday()
+                ])
+        except Exception as e:
+            logging.error(f"Failed to write to CSV: {e}")
+            
+    def setup_gpio(self):
+        """Initialize GPIO for relay control"""
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(RELAY_PIN, GPIO.OUT)
+        GPIO.output(RELAY_PIN, GPIO.LOW)  # Start with charger connected
+        logging.info("GPIO initialized - Charger connected (relay OFF)")
+        
+    def find_usb_device(self):
+        """Find the first available USB serial device"""
+        for port in SERIAL_PORTS:
+            if os.path.exists(port):
+                try:
+                    # Try to open the device briefly to verify it's accessible
+                    test_ser = serial.Serial(port, baudrate=BAUD_RATE, timeout=1)
+                    test_ser.close()
+                    logging.info(f"Found available USB device: {port}")
+                    return port
+                except Exception as e:
+                    logging.debug(f"USB device {port} not accessible: {e}")
+                    continue
+            else:
+                logging.debug(f"USB device {port} does not exist")
+        
+        # If no devices found, raise an error
+        available_ports = [port for port in SERIAL_PORTS if os.path.exists(port)]
+        if available_ports:
+            error_msg = f"No accessible USB devices found. Available but inaccessible: {available_ports}"
+        else:
+            error_msg = f"No USB devices found. Checked: {SERIAL_PORTS}"
+        
+        logging.error(error_msg)
+        raise Exception(error_msg)
+
+    def setup_serial(self):
+        """Initialize serial connection for voltage reading"""
+        try:
+            self.serial_port = self.find_usb_device()
+            self.ser = serial.Serial(self.serial_port, baudrate=BAUD_RATE, timeout=2)
+            logging.info(f"Serial connection established on {self.serial_port}")
+        except Exception as e:
+            logging.error(f"Failed to setup serial connection: {e}")
+            raise
+            
+    def read_voltage(self, recovery_attempt=False):
+        """Read voltage from VE.Direct protocol"""
+        try:
+            self.ser.flushInput()
+            
+            # Try more attempts since VE.Direct sends continuous data
+            for attempt in range(50):  # Increased from 10 to 50
+                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                
+                # Skip empty lines and null characters
+                if not line or line == '\x00' or len(line) < 2:
+                    continue
+                    
+                if line.startswith("V"):
+                    try:
+                        parts = line.split("\t")
+                        if len(parts) >= 2:
+                            mv = int(parts[1])
+                            voltage = mv / 1000.0
+                            self.last_voltage = voltage
+                            
+                            # Add to history for solar detection
+                            self.voltage_history.append((time.time(), voltage))
+                            
+                            return voltage
+                    except (ValueError, IndexError) as e:
+                        logging.warning(f"Error parsing voltage line '{line}': {e}")
+                        continue
+                        
+            logging.warning("No voltage reading received after 50 attempts")
+            return None
+            
+        except Exception as e:
+            logging.error(f"Error reading voltage: {e}")
+            
+            # Try to recover from USB device errors (only on first attempt)
+            if not recovery_attempt and ("Input/output error" in str(e) or "device reports readiness" in str(e)):
+                logging.warning("USB I/O error detected - attempting to reconnect...")
+                try:
+                    self.ser.close()
+                except:
+                    pass
+                
+                try:
+                    # Try to find and reconnect to USB device
+                    new_port = self.find_usb_device()
+                    if new_port != self.serial_port:
+                        logging.info(f"USB device changed from {self.serial_port} to {new_port}")
+                        self.serial_port = new_port
+                    
+                    self.ser = serial.Serial(self.serial_port, baudrate=BAUD_RATE, timeout=2)
+                    logging.info(f"Successfully reconnected to {self.serial_port}")
+                    
+                    # Try reading voltage again after reconnection (mark as recovery attempt)
+                    return self.read_voltage(recovery_attempt=True)
+                    
+                except Exception as reconnect_error:
+                    logging.error(f"Failed to reconnect USB device: {reconnect_error}")
+            
+            return None
+            
+    def detect_solar_charging(self):
+        """Enhanced solar detection using multiple methods"""
+        if not SOLAR_DETECTION_ENABLED or len(self.voltage_history) < 5:
+            return False
+            
+        try:
+            solar_indicators = []
+            detection_reasons = []
+            
+            # Method 1: Voltage Trend Analysis (original method)
+            if SOLAR_DETECTION_METHODS.get('voltage_trend', True):
+                trend_result = self._detect_solar_by_voltage_trend()
+                solar_indicators.append(trend_result)
+                if trend_result:
+                    detection_reasons.append("voltage_trend")
+            
+            # Method 2: Time-based Detection (daylight hours)
+            if SOLAR_DETECTION_METHODS.get('time_based', True):
+                time_result = self._detect_solar_by_time()
+                solar_indicators.append(time_result)
+                if time_result:
+                    detection_reasons.append("daylight_hours")
+            
+            # Method 3: Voltage Plateau Detection (high voltage sustained)
+            if SOLAR_DETECTION_METHODS.get('voltage_plateau', True):
+                plateau_result = self._detect_solar_by_plateau()
+                solar_indicators.append(plateau_result)
+                if plateau_result:
+                    detection_reasons.append("voltage_plateau")
+            
+            # Method 4: Load-Compensated Detection
+            if SOLAR_DETECTION_METHODS.get('load_compensation', True):
+                load_result = self._detect_solar_with_load_compensation()
+                solar_indicators.append(load_result)
+                if load_result:
+                    detection_reasons.append("load_compensated")
+            
+            # Solar is active if ANY method detects it (OR logic)
+            solar_active = any(solar_indicators)
+            
+            # Log status changes with detection method
+            if solar_active != self.solar_detected:
+                reason_str = "+".join(detection_reasons) if detection_reasons else "none"
+                logging.info(f"Solar status changed: {'ACTIVE' if solar_active else 'INACTIVE'} "
+                           f"(methods: {reason_str}, voltage: {self.last_voltage:.2f}V)")
+            
+            self.solar_detected = solar_active
+            return solar_active
+                
+        except Exception as e:
+            logging.error(f"Solar detection error: {e}")
+            
+        return False
+        
+    def _detect_solar_by_voltage_trend(self):
+        """Detect solar by rising voltage trend during daylight hours"""
+        recent_readings = list(self.voltage_history)[-10:]
+        if len(recent_readings) < 5:
+            return False
+            
+        times = [reading[0] for reading in recent_readings]
+        voltages = [reading[1] for reading in recent_readings]
+        
+        time_diff = times[-1] - times[0]
+        voltage_diff = voltages[-1] - voltages[0]
+        
+        if time_diff > 0:
+            voltage_rate = voltage_diff / (time_diff / 3600)
+            is_daylight = self._detect_solar_by_time()
+            
+            # Solar detected if voltage is rising during daylight hours
+            # (regardless of absolute voltage level)
+            return (voltage_rate > SOLAR_VOLTAGE_INCREASE_RATE and is_daylight)
+        return False
+        
+    def _detect_solar_by_time(self):
+        """Time-based solar detection during daylight hours"""
+        now = datetime.now()
+        current_hour = now.hour
+        season = self.get_current_season()
+        
+        # Get daylight hours for current season
+        if season in SOLAR_DAYLIGHT_HOURS:
+            start_hour, end_hour = SOLAR_DAYLIGHT_HOURS[season]
+            is_daylight = start_hour <= current_hour < end_hour
+            
+            # Solar panels work during daylight regardless of battery voltage
+            return is_daylight
+        
+        return False
+        
+    def _detect_solar_by_plateau(self):
+        """Detect solar by sustained high voltage (even with load)"""
+        if self.last_voltage < SOLAR_PLATEAU_THRESHOLD:
+            return False
+            
+        # Check if voltage has been high for minimum duration
+        recent_readings = list(self.voltage_history)
+        plateau_readings = [r for r in recent_readings 
+                          if r[1] >= SOLAR_PLATEAU_THRESHOLD]
+        
+        if len(plateau_readings) < 2:
+            return False
+            
+        # Check duration of plateau
+        plateau_duration = plateau_readings[-1][0] - plateau_readings[0][0]
+        is_daylight = self._detect_solar_by_time()
+        
+        return (plateau_duration >= SOLAR_PLATEAU_MIN_DURATION and 
+                is_daylight)
+        
+    def _detect_solar_with_load_compensation(self):
+        """Enhanced load-compensated solar detection using system specs"""
+        if len(self.voltage_history) < 20:  # Need more history
+            return False
+            
+        recent_readings = list(self.voltage_history)[-20:]  # Last 10 minutes
+        times = [r[0] for r in recent_readings]
+        voltages = [r[1] for r in recent_readings]
+        
+        time_diff = times[-1] - times[0]
+        voltage_diff = voltages[-1] - voltages[0]
+        
+        if time_diff > 0:
+            voltage_rate = voltage_diff / (time_diff / 3600)  # V/hour
+            is_daylight = self._detect_solar_by_time()
+            
+            if not is_daylight:
+                return False
+                
+            # Determine expected voltage drop based on system load patterns
+            # With 18kWh battery and up to 1kW load, we can estimate behavior
+            
+            # Strong solar indication: voltage rising despite potential load
+            if voltage_rate > 0.05:  # Rising faster than 0.05V/hour
+                return True
+                
+            # Moderate solar indication: voltage stable or dropping slowly
+            # Expected drops: Light load: -0.03V/h, Typical: -0.08V/h, Heavy: -0.15V/h
+            
+            if self.last_voltage > SOLAR_STRONG_GENERATION_THRESHOLD:
+                # High voltage suggests strong solar - even slow drop indicates solar
+                expected_drop_with_solar = -LIGHT_LOAD_VOLTAGE_DROP  # Solar compensating
+                return voltage_rate > expected_drop_with_solar
+                
+            elif self.last_voltage > SOLAR_PLATEAU_THRESHOLD:
+                # Medium voltage - compare to typical load drop
+                expected_drop_with_solar = -TYPICAL_NIGHTTIME_VOLTAGE_DROP * 0.5  # Solar partially compensating
+                return voltage_rate > expected_drop_with_solar
+                
+            else:
+                # Lower voltage - need clear indication of solar compensation
+                expected_drop_without_solar = -TYPICAL_NIGHTTIME_VOLTAGE_DROP
+                # If dropping significantly slower than expected, solar likely active
+                return voltage_rate > (expected_drop_without_solar * 0.6)
+        
+        return False
+        
+    def _estimate_current_load_level(self):
+        """Estimate current system load based on voltage drop rate"""
+        if len(self.voltage_history) < 10:
+            return "unknown"
+            
+        recent_readings = list(self.voltage_history)[-10:]
+        times = [r[0] for r in recent_readings]
+        voltages = [r[1] for r in recent_readings]
+        
+        time_diff = times[-1] - times[0]
+        voltage_diff = voltages[-1] - voltages[0]
+        
+        if time_diff > 0:
+            voltage_rate = voltage_diff / (time_diff / 3600)
+            
+            # During non-solar hours, voltage drop rate indicates load
+            if not self._detect_solar_by_time():
+                if voltage_rate <= -HEAVY_LOAD_VOLTAGE_DROP:
+                    return "heavy"  # >1kW load
+                elif voltage_rate <= -TYPICAL_NIGHTTIME_VOLTAGE_DROP:
+                    return "typical"  # ~1kW load
+                elif voltage_rate <= -LIGHT_LOAD_VOLTAGE_DROP:
+                    return "light"  # <0.5kW load
+                else:
+                    return "minimal"  # Very light load
+                    
+        return "unknown"
+        
+    def is_weekend_or_holiday(self):
+        """Check if current day is weekend (rates are different)"""
+        return datetime.now().weekday() >= 5  # Saturday = 5, Sunday = 6
+        
+    def get_current_season(self):
+        """Determine if we're in summer or winter rate period"""
+        current_month = datetime.now().month
+        if 6 <= current_month <= 9:  # June-September
+            return 'summer'
+        else:  # October-May
+            return 'winter'
+            
+    def get_current_rate_info(self):
+        """Get current electricity rate information based on your TOD schedule"""
+        now = datetime.now()
+        current_hour = now.hour
+        is_weekend = self.is_weekend_or_holiday()
+        season = self.get_current_season()
+        
+        # EV credit applies midnight-6AM every day
+        has_ev_credit = 0 <= current_hour < 6
+        
+        if is_weekend:
+            # Weekends and holidays are all off-peak
+            rate_type = "off_peak_weekend"
+            rate = RATE_INFO[season]['off_peak']
+        else:
+            # Weekday rates based on your TOD schedule
+            if season == 'summer':
+                if 0 <= current_hour < 12:  # Midnight-noon
+                    rate_type = "off_peak"
+                    rate = RATE_INFO[season]['off_peak']
+                elif 12 <= current_hour < 17:  # Noon-5PM
+                    rate_type = "mid_peak"
+                    rate = RATE_INFO[season]['mid_peak']
+                elif 17 <= current_hour < 20:  # 5PM-8PM (PEAK - most expensive!)
+                    rate_type = "peak"
+                    rate = RATE_INFO[season]['peak']
+                else:  # 8PM-midnight
+                    rate_type = "off_peak"
+                    rate = RATE_INFO[season]['off_peak']
+            else:  # winter
+                if 17 <= current_hour < 20:  # 5PM-8PM (PEAK)
+                    rate_type = "peak"
+                    rate = RATE_INFO[season]['peak']
+                else:  # All other hours are off-peak in winter
+                    rate_type = "off_peak"
+                    rate = RATE_INFO[season]['off_peak']
+        
+        # Apply EV credit if applicable (negative cost!)
+        if has_ev_credit:
+            rate += RATE_INFO[season]['ev_credit']  # EV credit is negative
+            rate_type += "_with_ev_credit"
+            
+        return rate_type, rate, has_ev_credit
+        
+    def is_preferred_charging_time(self):
+        """Check if current time is in preferred charging hours"""
+        current_hour = datetime.now().hour
+        is_weekend = self.is_weekend_or_holiday()
+        
+        # Weekends are always preferred (off-peak rates all day)
+        if is_weekend:
+            return True
+            
+        # Check preferred hours for weekdays
+        for start_hour, end_hour in PREFERRED_CHARGING_HOURS:
+            if start_hour <= end_hour:
+                # Same day range
+                if start_hour <= current_hour < end_hour:
+                    return True
+            else:
+                # Overnight range (crosses midnight)
+                if current_hour >= start_hour or current_hour < end_hour:
+                    return True
+                    
+        return False
+        
+    def is_avoid_charging_time(self):
+        """Check if current time is in avoid charging hours (peak rates)"""
+        current_hour = datetime.now().hour
+        is_weekend = self.is_weekend_or_holiday()
+        
+        # Weekends never have peak rates
+        if is_weekend:
+            return False
+            
+        # Check avoid hours for weekdays only (5PM-8PM peak rates)
+        for start_hour, end_hour in AVOID_CHARGING_HOURS:
+            if start_hour <= end_hour:
+                if start_hour <= current_hour < end_hour:
+                    return True
+            else:
+                if current_hour >= start_hour or current_hour < end_hour:
+                    return True
+                    
+        return False
+        
+    def should_charge(self, voltage):
+        """Determine if charging should be enabled based on voltage priority and other factors"""
+        # Safety first - always disconnect if voltage too high
+        if voltage >= VOLTAGE_THRESHOLD_HIGH:
+            return False, "SAFETY_HIGH_VOLTAGE"
+            
+        # CRITICAL: Inverter protection - always charge if approaching cutoff
+        if voltage <= CRITICAL_VOLTAGE_THRESHOLD:
+            return True, "CRITICAL_INVERTER_PROTECTION"
+            
+        # Emergency charging - always charge if battery critically low
+        if voltage <= EMERGENCY_VOLTAGE_THRESHOLD:
+            return True, "EMERGENCY_LOW_VOLTAGE"
+            
+        # Low voltage priority - prefer charging even during peak hours
+        if voltage <= LOW_VOLTAGE_PRIORITY_THRESHOLD:
+            # Only avoid charging during peak if voltage is not too low AND solar isn't active
+            if self.is_avoid_charging_time() and not self.solar_detected:
+                # Still charge during peak if voltage is getting concerning
+                if voltage <= (LOW_VOLTAGE_PRIORITY_THRESHOLD - 0.2):  # 22.8V
+                    return True, "LOW_VOLTAGE_OVERRIDE_PEAK"
+                else:
+                    return False, "LOW_VOLTAGE_PEAK_AVOIDANCE"
+            else:
+                return True, "LOW_VOLTAGE_PRIORITY"
+        
+        # Normal voltage operation (above 23.0V) - EV Credit Priority Logic
+        current_hour = datetime.now().hour
+        
+        # If voltage is healthy (>21.5V), prioritize EV credit period (12AM-6AM)
+        if voltage > EMAIL_RECOVERY_VOLTAGE_THRESHOLD:  # 21.5V
+            # If it's 10PM-11:59PM, wait for midnight EV credit period unless voltage drops
+            if 22 <= current_hour <= 23:
+                if voltage > 22.5:  # Higher threshold when waiting for EV credit
+                    return False, "WAITING_FOR_EV_CREDIT_PERIOD"
+                
+            # If it's currently EV credit hours (12AM-6AM), charge aggressively
+            if 0 <= current_hour < 6:
+                return True, "EV_CREDIT_PRIORITY"
+                
+            # If it's 6AM-10PM and voltage is healthy, be conservative
+            # Only charge during solar or if voltage drops more
+            if voltage > 23.0:  # Higher threshold when not in EV credit period
+                if self.solar_detected:
+                    return True, "SOLAR_ACTIVE"
+                else:
+                    return False, "VOLTAGE_HEALTHY_WAIT_FOR_EV_CREDIT"
+        
+        # If charger is currently connected, check if we should disconnect
+        if self.charger_connected:
+            # Disconnect during peak hours only if voltage is comfortable
+            if self.is_avoid_charging_time() and voltage > NORMAL_VOLTAGE_THRESHOLD:
+                return False, "PEAK_RATE_AVOIDANCE"
+                
+        # If charger is currently disconnected, check if we should reconnect
+        else:
+            # Only reconnect if voltage dropped below low threshold
+            if voltage > VOLTAGE_THRESHOLD_LOW:
+                return False, "HYSTERESIS"
+                
+        # Solar is active - prefer charging during solar hours
+        if self.solar_detected:
+            return True, "SOLAR_ACTIVE"
+            
+        # Check time-based preferences
+        if self.is_preferred_charging_time():
+            return True, "PREFERRED_HOURS"
+            
+        if self.is_avoid_charging_time():
+            return False, "AVOID_PEAK_HOURS"
+            
+        # Default: maintain current state if no strong preference
+        return self.charger_connected, "MAINTAIN_STATE"
+        
+    def get_voltage_status(self, voltage):
+        """Get human-readable voltage status (ASCII-only)"""
+        if voltage <= CRITICAL_VOLTAGE_THRESHOLD:
+            return "CRITICAL"
+        elif voltage <= EMERGENCY_VOLTAGE_THRESHOLD:
+            return "EMERGENCY"
+        elif voltage <= LOW_VOLTAGE_PRIORITY_THRESHOLD:
+            return "LOW"
+        elif voltage <= NORMAL_VOLTAGE_THRESHOLD:
+            return "NORMAL"
+        else:
+            return "HIGH"
+            
+    def send_email_notification(self, subject, message, is_critical=False):
+        """Send email notification for voltage alerts"""
+        if not EMAIL_NOTIFICATIONS_ENABLED:
+            return False
+            
+        if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO:
+            logging.warning("Email notifications enabled but credentials not configured")
+            return False
+            
+        try:
+            # Clean all text to ensure ASCII compatibility
+            def clean_ascii(text):
+                # Replace common unicode characters with ASCII equivalents
+                replacements = {
+                    '\xa0': ' ',  # Non-breaking space
+                    '\u2022': '-',  # Bullet point
+                    '\u2013': '-',  # En dash
+                    '\u2014': '-',  # Em dash
+                    '\u2018': "'",  # Left single quote
+                    '\u2019': "'",  # Right single quote
+                    '\u201c': '"',  # Left double quote
+                    '\u201d': '"',  # Right double quote
+                    '🔴': 'CRITICAL',
+                    '🟠': 'EMERGENCY', 
+                    '🟡': 'LOW',
+                    '🟢': 'NORMAL',
+                    '🔵': 'HIGH'
+                }
+                for unicode_char, ascii_char in replacements.items():
+                    text = text.replace(unicode_char, ascii_char)
+                
+                # Remove any remaining non-ASCII characters
+                text = ''.join(char if ord(char) < 128 else '?' for char in text)
+                return text
+            
+            # Create message with unique Message-ID to prevent duplicates
+            import uuid
+            msg = MIMEMultipart()
+            msg['From'] = clean_ascii(EMAIL_FROM)
+            msg['To'] = clean_ascii(', '.join(EMAIL_TO))
+            msg['Subject'] = clean_ascii(subject)
+            msg['Message-ID'] = f"<{uuid.uuid4()}@rv-battery-monitor>"
+            
+            # Add timestamp and system info to message (ASCII-safe)
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            load_level = self._estimate_current_load_level()
+            voltage_status = self.get_voltage_status(self.last_voltage)
+            voltage_status_clean = clean_ascii(voltage_status)
+            
+            full_message = f"""
+{clean_ascii(message)}
+
+System Status at {current_time}:
+- Battery Voltage: {self.last_voltage:.2f}V {voltage_status_clean}
+- Charger Status: {'Connected' if self.charger_connected else 'DISCONNECTED'}
+- Solar Status: {'Active' if self.solar_detected else 'Inactive'}
+- Load Level: {load_level.title()}
+- Inverter Cutoff: {INVERTER_CUTOFF_VOLTAGE}V
+
+Battery System: {BATTERY_CAPACITY_KWH}kWh capacity
+Typical Load: {TYPICAL_LOAD_KW}kW
+
+This is an automated alert from your RV Battery Monitor.
+            """
+            
+            # Clean the entire message
+            full_message_clean = clean_ascii(full_message)
+            
+            msg.attach(MIMEText(full_message_clean, 'plain'))
+            
+            # Send email
+            server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+            server.starttls()
+            server.login(EMAIL_FROM, EMAIL_PASSWORD)
+            text = msg.as_string()
+            
+            # Ensure EMAIL_TO is properly handled as a list
+            recipients = EMAIL_TO if isinstance(EMAIL_TO, list) else [EMAIL_TO]
+            server.sendmail(EMAIL_FROM, recipients, text)
+            server.quit()
+            
+            logging.info(f"Email notification sent: {clean_ascii(subject)}")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to send email notification: {e}")
+            return False
+    
+    def test_email_system(self, test_type="basic"):
+        """Test email notification system with different scenarios"""
+        logging.info(f"🧪 Testing email system: {test_type}")
+        
+        if not EMAIL_NOTIFICATIONS_ENABLED:
+            logging.warning("Email notifications are disabled in config")
+            return False
+            
+        if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO:
+            logging.error("Email configuration incomplete")
+            return False
+        
+        test_scenarios = {
+            "basic": (23.5, "🧪 Basic Email Test"),
+            "low": (20.9, "🟡 Low Voltage Test"),
+            "critical_low": (20.5, "🔴 Critical Low Voltage Test"),
+            "high": (24.7, "🟠 High Voltage Test"),
+            "critical_high": (25.2, "🔴 Critical High Voltage Test"),
+            "recovery": (21.8, "🔵 Recovery Test")
+        }
+        
+        if test_type == "basic":
+            # Send a basic test email
+            subject = "🧪 Battery Monitor Email Test"
+            message = f"""
+This is a test email from your RV Battery Monitor system.
+
+Test Details:
+- Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+- System status: Operational
+- Email configuration: Working ✅
+
+Voltage Thresholds:
+- Critical high: {EMAIL_CRITICAL_HIGH_VOLTAGE_THRESHOLD}V
+- High: {VOLTAGE_THRESHOLD_HIGH}V
+- Low: {VOLTAGE_THRESHOLD_LOW}V
+- Critical low: {EMAIL_CRITICAL_VOLTAGE_THRESHOLD}V
+
+If you receive this email, your battery monitoring alerts are configured correctly!
+            """
+            
+            success = self.send_email_notification(subject, message)
+            if success:
+                logging.info("✅ Test email sent successfully")
+            else:
+                logging.error("❌ Test email failed")
+            return success
+            
+        elif test_type in test_scenarios:
+            voltage, description = test_scenarios[test_type]
+            logging.info(f"Testing {description} at {voltage}V")
+            
+            # Temporarily store current state
+            original_voltage = self.last_voltage
+            self.last_voltage = voltage
+            
+            # Trigger the alert
+            self.check_voltage_alerts(voltage)
+            
+            # Restore original state
+            self.last_voltage = original_voltage
+            
+            logging.info(f"✅ {description} completed")
+            return True
+            
+        else:
+            logging.error(f"Unknown test type: {test_type}")
+            return False
+            
+    def check_voltage_alerts(self, voltage):
+        """Check voltage and send email alerts if needed"""
+        if not EMAIL_NOTIFICATIONS_ENABLED:
+            return
+            
+        now = datetime.now()
+        cooldown_period = timedelta(minutes=EMAIL_COOLDOWN_MINUTES)
+        
+        # Critical HIGH voltage alert (most urgent - potential damage)
+        if voltage >= EMAIL_CRITICAL_HIGH_VOLTAGE_THRESHOLD:
+            if not self.voltage_critical_high_sent or (
+                self.last_email_critical_high and now - self.last_email_critical_high > cooldown_period
+            ):
+                subject = f"CRITICAL HIGH VOLTAGE ALERT: RV Battery at {voltage:.2f}V - IMMEDIATE ATTENTION REQUIRED!"
+                message = f"""
+CRITICAL HIGH VOLTAGE ALERT!
+
+Your RV battery voltage has reached {voltage:.2f}V, which is DANGEROUSLY HIGH and exceeds the critical threshold of {EMAIL_CRITICAL_HIGH_VOLTAGE_THRESHOLD}V.
+
+IMMEDIATE ACTIONS REQUIRED:
+- Charger has been automatically DISCONNECTED for safety
+- Check solar charge controller settings - may be overcharging
+- Verify battery condition - possible cell imbalance or failure
+- Consider disconnecting solar panels if voltage continues rising
+- Monitor voltage closely - do not leave unattended
+
+POTENTIAL RISKS:
+- Battery damage or reduced lifespan
+- Electrolyte loss (venting)
+- Fire or explosion risk in extreme cases
+- System component damage
+
+Current Status:
+- Charger: {'Connected' if self.charger_connected else 'DISCONNECTED (SAFETY)'}
+- Solar: {'Active' if self.solar_detected else 'Inactive'}
+- Critical high threshold: {EMAIL_CRITICAL_HIGH_VOLTAGE_THRESHOLD}V
+- Normal high threshold: {VOLTAGE_THRESHOLD_HIGH}V
+
+This voltage level requires immediate investigation and corrective action.
+                """
+                
+                if self.send_email_notification(subject, message, is_critical=True):
+                    self.last_email_critical_high = now
+                    self.voltage_critical_high_sent = True
+                    
+        # Critical LOW voltage alert (most urgent)
+        if voltage <= EMAIL_CRITICAL_VOLTAGE_THRESHOLD:
+            if not self.voltage_critical_sent or (
+                self.last_email_critical and now - self.last_email_critical > cooldown_period
+            ):
+                subject = f"CRITICAL ALERT: RV Battery at {voltage:.2f}V - Immediate Action Required!"
+                message = f"""
+CRITICAL BATTERY ALERT!
+
+Your RV battery voltage has dropped to {voltage:.2f}V, which is dangerously close to your inverter cutoff voltage of {INVERTER_CUTOFF_VOLTAGE}V.
+
+IMMEDIATE ACTION REQUIRED:
+- Check if charger is connected and working
+- Reduce power consumption immediately
+- Consider starting generator if available
+- System may shut down soon if voltage continues to drop
+
+Time until inverter shutdown: Approximately {((voltage - INVERTER_CUTOFF_VOLTAGE) / HEAVY_LOAD_VOLTAGE_DROP * 60):.0f} minutes at current load.
+                """
+                
+                if self.send_email_notification(subject, message, is_critical=True):
+                    self.last_email_critical = now
+                    self.voltage_critical_sent = True
+                    
+        # Regular low voltage alert (only if not already critical)
+        elif voltage <= EMAIL_ALERT_VOLTAGE_THRESHOLD and voltage > EMAIL_CRITICAL_VOLTAGE_THRESHOLD:
+            if not self.voltage_alert_sent or (
+                self.last_email_alert and now - self.last_email_alert > cooldown_period
+            ):
+                subject = f"Low Battery Alert: RV Battery at {voltage:.2f}V"
+                message = f"""
+Low Battery Voltage Alert
+
+Your RV battery voltage has dropped to {voltage:.2f}V.
+
+Current Status:
+- Charger: {'Connected' if self.charger_connected else 'DISCONNECTED'}
+- Solar: {'Active' if self.solar_detected else 'Inactive'}
+- Critical threshold: {EMAIL_CRITICAL_VOLTAGE_THRESHOLD}V
+- Inverter cutoff: {INVERTER_CUTOFF_VOLTAGE}V
+
+Recommended Actions:
+- Ensure charger is connected if available
+- Consider reducing power consumption
+- Monitor voltage closely
+                """
+                
+                if self.send_email_notification(subject, message):
+                    self.last_email_alert = now
+                    self.voltage_alert_sent = True
+
+        # High voltage alert (safety threshold reached)
+        elif voltage >= VOLTAGE_THRESHOLD_HIGH:
+            if not self.voltage_high_sent or (
+                self.last_email_high_voltage and now - self.last_email_high_voltage > cooldown_period
+            ):
+                subject = f"HIGH VOLTAGE ALERT: RV Battery at {voltage:.2f}V - Charger Disconnected!"
+                message = f"""
+HIGH VOLTAGE SAFETY ALERT!
+
+Your RV battery voltage has reached {voltage:.2f}V, which exceeds the safety threshold of {VOLTAGE_THRESHOLD_HIGH}V.
+
+SAFETY ACTION TAKEN:
+- Charger has been automatically DISCONNECTED to prevent overcharging
+- System will reconnect charger when voltage drops below {VOLTAGE_THRESHOLD_LOW}V
+
+Current Status:
+- Charger: {'Connected' if self.charger_connected else 'DISCONNECTED (SAFETY)'}
+- Solar: {'Active' if self.solar_detected else 'Inactive'}
+- Safety disconnect threshold: {VOLTAGE_THRESHOLD_HIGH}V
+- Reconnect threshold: {VOLTAGE_THRESHOLD_LOW}V
+
+This is normal behavior when:
+- Solar panels are generating power and battery is full
+- External charger is providing too much current
+- Battery is reaching full charge capacity
+
+No immediate action required - system is operating safely.
+Monitor voltage and ensure it stabilizes below {VOLTAGE_THRESHOLD_HIGH}V.
+                """
+                
+                if self.send_email_notification(subject, message):
+                    self.last_email_high_voltage = now
+                    self.voltage_high_sent = True
+                    
+        # Recovery notification (for both low and high voltage alerts)
+        elif EMAIL_RECOVERY_VOLTAGE_THRESHOLD <= voltage < VOLTAGE_THRESHOLD_HIGH:
+            # Recovery from low voltage alerts
+            if (self.voltage_alert_sent or self.voltage_critical_sent):
+                subject = f"Battery Recovery: RV Battery at {voltage:.2f}V"
+                message = f"""
+Battery Voltage Recovery
+
+Your RV battery voltage has recovered to {voltage:.2f}V.
+
+The low voltage alert condition has been cleared.
+System is operating normally.
+                """
+                
+                if self.send_email_notification(subject, message):
+                    self.last_email_recovery = now
+                    # Don't reset flags immediately - let cooldown period handle it
+                    # This prevents rapid successive emails if voltage fluctuates
+                    # self.voltage_alert_sent = False  # REMOVED: Let cooldown manage this
+                    # self.voltage_critical_sent = False  # REMOVED: Let cooldown manage this
+                    
+            # Recovery from critical high voltage alert
+            elif self.voltage_critical_high_sent:
+                subject = f"CRITICAL High Voltage Recovery: RV Battery at {voltage:.2f}V"
+                message = f"""
+CRITICAL High Voltage Recovery
+
+Your RV battery voltage has returned to {voltage:.2f}V, which is below the critical high threshold of {EMAIL_CRITICAL_HIGH_VOLTAGE_THRESHOLD}V.
+
+RECOVERY STATUS:
+- Voltage is now in safer operating range
+- Critical high voltage condition has been cleared
+- System monitoring continues
+
+Current Status:
+- Charger: {'Connected' if self.charger_connected else 'Disconnected'}
+- Solar: {'Active' if self.solar_detected else 'Inactive'}
+- Critical high threshold: {EMAIL_CRITICAL_HIGH_VOLTAGE_THRESHOLD}V
+- Normal high threshold: {VOLTAGE_THRESHOLD_HIGH}V
+
+RECOMMENDED ACTIONS:
+- Continue monitoring voltage closely
+- Verify what caused the high voltage (solar controller, charger settings)
+- Consider system inspection to prevent recurrence
+
+System has returned to safer operation, but investigation is still recommended.
+                """
+                
+                if self.send_email_notification(subject, message):
+                    self.last_email_recovery = now
+                    # Reset critical high voltage flag after recovery
+                    self.voltage_critical_high_sent = False
+                    
+            # Recovery from regular high voltage alert
+            elif self.voltage_high_sent:
+                subject = f"High Voltage Recovery: RV Battery at {voltage:.2f}V"
+                message = f"""
+High Voltage Recovery
+
+Your RV battery voltage has returned to {voltage:.2f}V, which is below the safety threshold of {VOLTAGE_THRESHOLD_HIGH}V.
+
+Current Status:
+- Charger: {'Connected' if self.charger_connected else 'Disconnected'}
+- Solar: {'Active' if self.solar_detected else 'Inactive'}
+- Voltage is now in normal operating range
+
+System has returned to normal charging operation.
+                """
+                
+                if self.send_email_notification(subject, message):
+                    self.last_email_recovery = now
+                    # Reset high voltage flag after cooldown
+                    self.voltage_high_sent = False
+        
+    def control_charger(self, should_connect, reason):
+        """Control charger connection via relay"""
+        if should_connect and not self.charger_connected:
+            GPIO.output(RELAY_PIN, GPIO.LOW)
+            self.charger_connected = True
+            logging.info(f"🟢 CHARGER CONNECTED - {reason}")
+            
+        elif not should_connect and self.charger_connected:
+            GPIO.output(RELAY_PIN, GPIO.HIGH)
+            self.charger_connected = False
+            logging.warning(f"🔴 CHARGER DISCONNECTED - {reason}")
+            
+    def log_detailed_status(self, voltage):
+        """Log detailed system status periodically"""
+        now = time.time()
+        if now - self.last_detailed_log < LOG_INTERVAL:
+            return
+            
+        self.last_detailed_log = now
+        current_time = datetime.now().strftime("%H:%M")
+        rate_type, current_rate, has_ev_credit = self.get_current_rate_info()
+        load_level = self._estimate_current_load_level()
+        
+        # Calculate estimated battery runtime at current load
+        if voltage > 22.0:  # Only calculate if battery has reasonable charge
+            current_capacity_pct = min(100, max(0, (voltage - 20.0) / 5.2 * 100))  # Rough estimate
+            current_capacity_kwh = BATTERY_CAPACITY_KWH * (current_capacity_pct / 100)
+            
+            load_kw_estimate = {
+                "minimal": 0.1, "light": 0.5, "typical": 1.0, "heavy": 1.5, "unknown": 1.0
+            }.get(load_level, 1.0)
+            
+            estimated_runtime = current_capacity_kwh / load_kw_estimate if load_kw_estimate > 0 else 0
+        else:
+            estimated_runtime = 0
+            current_capacity_pct = 0
+        
+        status_msg = (
+            f"📊 DETAILED STATUS [{current_time}] - "
+            f"Voltage: {voltage:.2f}V ({current_capacity_pct:.0f}%) | "
+            f"Est. Runtime: {estimated_runtime:.1f}h | "
+            f"Load: {load_level} | "
+            f"Charger: {'Connected' if self.charger_connected else 'DISCONNECTED'} | "
+            f"Solar: {'Active' if self.solar_detected else 'Inactive'} | "
+            f"Rate: {current_rate:.1f}¢/kWh ({rate_type}) | "
+            f"EV Credit: {'Yes' if has_ev_credit else 'No'} | "
+            f"Season: {self.get_current_season().title()}"
+        )
+        
+        logging.info(status_msg)
+        
+    def monitor_loop(self):
+        """Main monitoring loop with smart charging logic"""
+        logging.info("🚀 Starting Smart Battery Monitor with TOD Optimization...")
+        logging.info(f"🔋 Battery System: {BATTERY_CAPACITY_KWH}kWh, {TYPICAL_LOAD_KW}kW typical load")
+        logging.info(f"⚡ Inverter cutoff: {INVERTER_CUTOFF_VOLTAGE}V")
+        logging.info(f"🚨 Voltage thresholds: Critical={CRITICAL_VOLTAGE_THRESHOLD}V, Emergency={EMERGENCY_VOLTAGE_THRESHOLD}V")
+        logging.info(f"🔧 Safety thresholds: High={VOLTAGE_THRESHOLD_HIGH}V, Low={VOLTAGE_THRESHOLD_LOW}V")
+        logging.info(f"⏰ Preferred hours: {PREFERRED_CHARGING_HOURS}")
+        logging.info(f"🚫 Peak avoid hours: {AVOID_CHARGING_HOURS}")
+        logging.info(f"☀️ Solar detection: {'Enabled' if SOLAR_DETECTION_ENABLED else 'Disabled'}")
+        logging.info(f"📅 Current season: {self.get_current_season().title()}")
+        
+        try:
+            while True:
+                voltage = self.read_voltage()
+                
+                if voltage is not None:
+                    # Check for voltage alerts and send emails if needed
+                    self.check_voltage_alerts(voltage)
+                    
+                    # Detect solar activity
+                    self.detect_solar_charging()
+                    
+                    # Get current rate info
+                    rate_type, current_rate, has_ev_credit = self.get_current_rate_info()
+                    
+                    # Determine charging decision
+                    should_connect, reason = self.should_charge(voltage)
+                    
+                    # Control charger
+                    self.control_charger(should_connect, reason)
+                    
+                    # Log to CSV
+                    self.log_to_csv(voltage, reason)
+                    
+                    # Regular status log with rate info and voltage status
+                    charger_status = "Connected" if self.charger_connected else "DISCONNECTED"
+                    solar_status = "☀️" if self.solar_detected else "🌙"
+                    ev_credit_status = "💰" if has_ev_credit else ""
+                    voltage_status = self.get_voltage_status(voltage)
+                    
+                    logging.info(f"{solar_status}{ev_credit_status} {voltage:.2f}V {voltage_status} - "
+                               f"Charger: {charger_status} ({reason}) - "
+                               f"Rate: {current_rate:.1f}¢/kWh")
+                    
+                    # Detailed periodic logging
+                    self.log_detailed_status(voltage)
+                    
+                else:
+                    logging.warning("Failed to read voltage - maintaining current state")
+                    
+                time.sleep(MONITOR_INTERVAL)
+                
+        except KeyboardInterrupt:
+            logging.info("Monitoring stopped by user")
+        except Exception as e:
+            logging.error(f"Monitoring error: {e}")
+        finally:
+            self.cleanup()
+            
+    def cleanup(self):
+        """Clean up GPIO and serial connections"""
+        try:
+            # Force charger connection before cleanup
+            logging.info("Cleanup starting - forcing charger connection")
+            GPIO.output(RELAY_PIN, GPIO.LOW)  # Ensure charger connected
+            logging.info("Charger relay set to connected state")
+            
+            # Clean up GPIO
+            GPIO.cleanup()
+            logging.info("GPIO cleanup completed")
+            
+            # Close serial connection
+            if hasattr(self, 'ser'):
+                self.ser.close()
+                logging.info("Serial connection closed")
+                
+            logging.info("Cleanup completed successfully - Charger connected")
+        except Exception as e:
+            logging.error(f"Cleanup error: {e}")
+            # Try to force charger connection even if other cleanup fails
+            try:
+                import RPi.GPIO as GPIO
+                GPIO.setmode(GPIO.BCM)
+                GPIO.setup(RELAY_PIN, GPIO.OUT)
+                GPIO.output(RELAY_PIN, GPIO.LOW)
+                logging.info("Emergency charger connection successful")
+            except Exception as e2:
+                logging.error(f"Emergency charger connection failed: {e2}")
+
+def main():
+    """Main function"""
+    try:
+        monitor = SmartBatteryMonitor()
+        monitor.monitor_loop()
+    except Exception as e:
+        logging.error(f"Failed to start smart battery monitor: {e}")
+        try:
+            GPIO.cleanup()
+        except:
+            pass
+
+if __name__ == "__main__":
+    main()

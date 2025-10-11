@@ -1,0 +1,21 @@
+[Unit]
+Description=Smart Battery Monitor with Time-of-Day Optimization
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=erictran
+Group=erictran
+WorkingDirectory=/home/erictran/Script
+ExecStart=/usr/bin/python3 /home/erictran/Script/smart_battery_monitor.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment variables
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

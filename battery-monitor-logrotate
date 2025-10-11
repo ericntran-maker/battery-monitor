@@ -1,0 +1,24 @@
+/home/erictran/Script/battery_monitor.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 644 erictran erictran
+    postrotate
+        # Send SIGUSR1 to reload logs if needed
+        /bin/systemctl reload-or-restart battery-monitor.service > /dev/null 2>&1 || true
+    endscript
+}
+
+/home/erictran/Script/voltage_history.csv {
+    monthly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 644 erictran erictran
+    # Keep CSV files but compress old ones
+}

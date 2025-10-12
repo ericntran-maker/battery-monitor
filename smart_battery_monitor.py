@@ -41,10 +41,16 @@ class SmartBatteryMonitor:
         self.last_email_recovery = None
         self.last_email_high_voltage = None
         self.last_email_critical_high = None
+        self.last_email_comm_failure = None
         self.voltage_alert_sent = False
         self.voltage_critical_sent = False
         self.voltage_high_sent = False
         self.voltage_critical_high_sent = False
+        self.comm_failure_sent = False
+        
+        # Communication failure tracking
+        self.last_successful_voltage_read = time.time()
+        self.consecutive_read_failures = 0
         
         # CSV logging setup
         if ENABLE_CSV_LOGGING:
@@ -69,7 +75,8 @@ class SmartBatteryMonitor:
                 writer.writerow([
                     'timestamp', 'voltage', 'charger_connected', 'solar_detected',
                     'in_preferred_hours', 'in_avoid_hours', 'charging_decision',
-                    'rate_type', 'current_rate_cents', 'has_ev_credit', 'season', 'is_weekend'
+                    'rate_type', 'current_rate_cents', 'has_ev_credit', 'utility_season', 
+                    'monthly_season', 'solar_factor', 'is_weekend'
                 ])
                 
     def log_to_csv(self, voltage, charging_decision):
@@ -93,7 +100,9 @@ class SmartBatteryMonitor:
                     rate_type,
                     f"{current_rate:.2f}",
                     has_ev_credit,
-                    self.get_current_season(),
+                    self.get_current_season(),  # Utility season for rates
+                    self.get_monthly_season_name(),  # Descriptive monthly season
+                    f"{self.get_solar_factor():.2f}",  # Solar generation factor
                     self.is_weekend_or_holiday()
                 ])
         except Exception as e:
@@ -163,6 +172,10 @@ class SmartBatteryMonitor:
                             voltage = mv / 1000.0
                             self.last_voltage = voltage
                             
+                            # Track successful read
+                            self.last_successful_voltage_read = time.time()
+                            self.consecutive_read_failures = 0
+                            
                             # Add to history for solar detection
                             self.voltage_history.append((time.time(), voltage))
                             
@@ -172,6 +185,7 @@ class SmartBatteryMonitor:
                         continue
                         
             logging.warning("No voltage reading received after 50 attempts")
+            self.consecutive_read_failures += 1
             return None
             
         except Exception as e:
@@ -201,6 +215,8 @@ class SmartBatteryMonitor:
                 except Exception as reconnect_error:
                     logging.error(f"Failed to reconnect USB device: {reconnect_error}")
             
+            # Track failure
+            self.consecutive_read_failures += 1
             return None
             
     def detect_solar_charging(self):
@@ -279,20 +295,26 @@ class SmartBatteryMonitor:
         return False
         
     def _detect_solar_by_time(self):
-        """Time-based solar detection during daylight hours"""
+        """Time-based solar detection using monthly daylight hours"""
         now = datetime.now()
         current_hour = now.hour
-        season = self.get_current_season()
         
-        # Get daylight hours for current season
-        if season in SOLAR_DAYLIGHT_HOURS:
-            start_hour, end_hour = SOLAR_DAYLIGHT_HOURS[season]
-            is_daylight = start_hour <= current_hour < end_hour
-            
-            # Solar panels work during daylight regardless of battery voltage
-            return is_daylight
+        # Get precise daylight hours for current month
+        start_hour, end_hour = self.get_monthly_daylight_hours()
+        is_daylight = start_hour <= current_hour < end_hour
         
-        return False
+        # Apply solar factor for more accurate detection
+        solar_factor = self.get_solar_factor()
+        
+        # In very low solar months (Dec/Jan), be more conservative
+        if solar_factor < 0.3:
+            # Require more restrictive daylight hours in deep winter
+            peak_hours = (start_hour + 2, end_hour - 2)
+            if peak_hours[0] < peak_hours[1]:  # Valid range
+                is_peak_daylight = peak_hours[0] <= current_hour < peak_hours[1]
+                return is_daylight and is_peak_daylight
+        
+        return is_daylight
         
     def _detect_solar_by_plateau(self):
         """Detect solar by sustained high voltage (even with load)"""
@@ -394,12 +416,29 @@ class SmartBatteryMonitor:
         return datetime.now().weekday() >= 5  # Saturday = 5, Sunday = 6
         
     def get_current_season(self):
-        """Determine if we're in summer or winter rate period"""
+        """Determine if we're in summer or winter rate period (for utility billing)"""
         current_month = datetime.now().month
         if 6 <= current_month <= 9:  # June-September
             return 'summer'
         else:  # October-May
             return 'winter'
+    
+    def get_current_month_profile(self):
+        """Get detailed monthly solar profile for current month"""
+        current_month = datetime.now().month
+        return MONTHLY_SOLAR_PROFILE.get(current_month, MONTHLY_SOLAR_PROFILE[1])
+    
+    def get_monthly_season_name(self):
+        """Get descriptive seasonal name based on current month"""
+        return self.get_current_month_profile()['name']
+    
+    def get_solar_factor(self):
+        """Get solar generation factor for current month (0.0 to 1.0)"""
+        return self.get_current_month_profile()['solar_factor']
+    
+    def get_monthly_daylight_hours(self):
+        """Get daylight hours for current month"""
+        return self.get_current_month_profile()['daylight']
             
     def get_current_rate_info(self):
         """Get current electricity rate information based on your TOD schedule"""
@@ -450,9 +489,14 @@ class SmartBatteryMonitor:
         current_hour = datetime.now().hour
         is_weekend = self.is_weekend_or_holiday()
         
-        # Weekends are always preferred (off-peak rates all day)
+        # Weekends have off-peak rates all day, but still use strategic timing
+        # Only treat EV credit hours as truly "preferred" on weekends
         if is_weekend:
-            return True
+            # EV credit hours are preferred even on weekends (cheapest rates)
+            if 0 <= current_hour < 6:
+                return True
+            # Other weekend hours are "acceptable" but not "preferred"
+            return False
             
         # Check preferred hours for weekdays
         for start_hour, end_hour in PREFERRED_CHARGING_HOURS:
@@ -513,52 +557,70 @@ class SmartBatteryMonitor:
             else:
                 return True, "LOW_VOLTAGE_PRIORITY"
         
-        # Normal voltage operation (above 23.0V) - EV Credit Priority Logic
-        current_hour = datetime.now().hour
-        
-        # If voltage is healthy (>21.5V), prioritize EV credit period (12AM-6AM)
-        if voltage > EMAIL_RECOVERY_VOLTAGE_THRESHOLD:  # 21.5V
-            # If it's 10PM-11:59PM, wait for midnight EV credit period unless voltage drops
-            if 22 <= current_hour <= 23:
-                if voltage > 22.5:  # Higher threshold when waiting for EV credit
-                    return False, "WAITING_FOR_EV_CREDIT_PERIOD"
-                
-            # If it's currently EV credit hours (12AM-6AM), charge aggressively
-            if 0 <= current_hour < 6:
-                return True, "EV_CREDIT_PRIORITY"
-                
-            # If it's 6AM-10PM and voltage is healthy, be conservative
-            # Only charge during solar or if voltage drops more
-            if voltage > 23.0:  # Higher threshold when not in EV credit period
-                if self.solar_detected:
-                    return True, "SOLAR_ACTIVE"
-                else:
-                    return False, "VOLTAGE_HEALTHY_WAIT_FOR_EV_CREDIT"
-        
-        # If charger is currently connected, check if we should disconnect
-        if self.charger_connected:
-            # Disconnect during peak hours only if voltage is comfortable
-            if self.is_avoid_charging_time() and voltage > NORMAL_VOLTAGE_THRESHOLD:
-                return False, "PEAK_RATE_AVOIDANCE"
-                
-        # If charger is currently disconnected, check if we should reconnect
-        else:
-            # Only reconnect if voltage dropped below low threshold
-            if voltage > VOLTAGE_THRESHOLD_LOW:
-                return False, "HYSTERESIS"
-                
-        # Solar is active - prefer charging during solar hours
+        # Solar is active - prefer charging during solar hours (HIGH PRIORITY)
         if self.solar_detected:
             return True, "SOLAR_ACTIVE"
+        
+        # Normal voltage operation - Smart time-based charging
+        current_hour = datetime.now().hour
+        
+        # If voltage is healthy (>21.5V), use smart charging logic
+        if voltage > EMAIL_RECOVERY_VOLTAGE_THRESHOLD:  # 21.5V
+            # EV credit hours (12AM-6AM) - always charge (cheapest rates)
+            if 0 <= current_hour < 6:
+                return True, "EV_CREDIT_PRIORITY"
             
-        # Check time-based preferences
+            # Preferred charging hours (now only EV credit on weekends)
+            if self.is_preferred_charging_time():
+                if voltage < 23.5:  # Don't overcharge during preferred hours
+                    return True, "PREFERRED_HOURS"
+                else:
+                    return False, "VOLTAGE_HIGH_SKIP_PREFERRED"
+            
+            # Weekend logic - only charge if voltage warrants it
+            if self.is_weekend_or_holiday():
+                # On weekends, only charge if voltage is getting low
+                if voltage <= 22.5:  # Lower threshold for weekend charging
+                    return True, "WEEKEND_LOW_VOLTAGE"
+                else:
+                    return False, "WEEKEND_WAIT_FOR_EV_CREDIT"
+            
+            # Daylight hours (potential solar) - charge if voltage reasonable
+            start_hour, end_hour = self.get_monthly_daylight_hours()
+            if start_hour <= current_hour < end_hour:
+                if voltage < 23.2:  # Slightly lower threshold for daylight
+                    return True, "DAYLIGHT_HOURS_POTENTIAL_SOLAR"
+                else:
+                    return False, "VOLTAGE_HIGH_SKIP_DAYLIGHT"
+            
+            # Peak avoidance hours (5PM-8PM) - be conservative
+            if self.is_avoid_charging_time():
+                return False, "PEAK_RATE_AVOIDANCE"
+            
+            # Evening (8PM-11:59PM) - wait for EV credit unless voltage drops significantly
+            if 20 <= current_hour <= 23:
+                if voltage > 22.2:  # Lower threshold - be more willing to wait for EV credit
+                    return False, "WAITING_FOR_EV_CREDIT_PERIOD"
+            
+            # Default for healthy voltage - wait for better rates
+            if voltage > 23.0:
+                return False, "VOLTAGE_HEALTHY_WAIT_FOR_EV_CREDIT"
+        
+        # Hysteresis for charger state changes (prevent rapid toggling)
+        if self.charger_connected:
+            # If currently connected, only disconnect if voltage is high enough
+            if voltage > VOLTAGE_THRESHOLD_LOW:  # 24.1V
+                return False, "HYSTERESIS_DISCONNECT"
+        else:
+            # If currently disconnected, only reconnect if voltage dropped significantly
+            if voltage > VOLTAGE_THRESHOLD_LOW:
+                return False, "HYSTERESIS_STAY_DISCONNECTED"
+            
+        # Fallback: Check time-based preferences (should rarely reach here)
         if self.is_preferred_charging_time():
-            return True, "PREFERRED_HOURS"
+            return True, "FALLBACK_PREFERRED_HOURS"
             
-        if self.is_avoid_charging_time():
-            return False, "AVOID_PEAK_HOURS"
-            
-        # Default: maintain current state if no strong preference
+        # Default: maintain current state
         return self.charger_connected, "MAINTAIN_STATE"
         
     def get_voltage_status(self, voltage):
@@ -934,6 +996,112 @@ System has returned to normal charging operation.
                     self.last_email_recovery = now
                     # Reset high voltage flag after cooldown
                     self.voltage_high_sent = False
+    
+    def check_communication_failure(self):
+        """Check for prolonged communication failures and send alerts"""
+        if not EMAIL_NOTIFICATIONS_ENABLED:
+            return
+            
+        now = datetime.now()
+        time_since_last_read = time.time() - self.last_successful_voltage_read
+        minutes_since_last_read = time_since_last_read / 60
+        
+        cooldown_period = timedelta(minutes=EMAIL_COOLDOWN_MINUTES)
+        
+        # Critical communication failure (30+ minutes)
+        if minutes_since_last_read >= COMM_FAILURE_CRITICAL_MINUTES:
+            if not self.comm_failure_sent or (
+                self.last_email_comm_failure and now - self.last_email_comm_failure > cooldown_period
+            ):
+                subject = f"CRITICAL: Battery Monitor Communication Failure - {minutes_since_last_read:.0f} Minutes!"
+                message = f"""
+CRITICAL COMMUNICATION FAILURE!
+
+Your RV battery monitoring system has been unable to read voltage for {minutes_since_last_read:.0f} minutes.
+
+IMMEDIATE ATTENTION REQUIRED:
+- Battery voltage monitoring is OFFLINE
+- Unable to control charger based on voltage
+- System safety features may be compromised
+
+Troubleshooting Steps:
+1. Check USB connections to battery monitor device
+2. Verify VE.Direct cable connections
+3. Check if USB device changed (/dev/ttyUSB0 to /dev/ttyUSB1, etc.)
+4. Restart battery monitoring service
+5. Check system logs for detailed error messages
+
+System Status:
+- Last successful voltage read: {datetime.fromtimestamp(self.last_successful_voltage_read).strftime('%Y-%m-%d %H:%M:%S')}
+- Consecutive failures: {self.consecutive_read_failures}
+- Charger: {'Connected' if self.charger_connected else 'Disconnected'}
+- Solar detection: {'Active' if self.solar_detected else 'Inactive'}
+
+WARNING: Without voltage monitoring, the system cannot:
+- Prevent battery over-discharge
+- Optimize charging based on voltage
+- Send voltage-based alerts
+- Protect against dangerous voltage levels
+
+Please investigate and restore communication immediately!
+                """
+                
+                if self.send_email_notification(subject, message, is_critical=True):
+                    self.last_email_comm_failure = now
+                    self.comm_failure_sent = True
+                    
+        # Initial communication failure alert (10+ minutes)
+        elif minutes_since_last_read >= COMM_FAILURE_ALERT_MINUTES:
+            if not self.comm_failure_sent or (
+                self.last_email_comm_failure and now - self.last_email_comm_failure > cooldown_period
+            ):
+                subject = f"Battery Monitor Communication Issue - {minutes_since_last_read:.0f} Minutes"
+                message = f"""
+Battery Monitor Communication Alert
+
+Your RV battery monitoring system has been unable to read voltage for {minutes_since_last_read:.0f} minutes.
+
+Current Status:
+- Last successful voltage read: {datetime.fromtimestamp(self.last_successful_voltage_read).strftime('%Y-%m-%d %H:%M:%S')}
+- Consecutive failures: {self.consecutive_read_failures}
+- System is attempting automatic recovery
+
+Possible Causes:
+- USB device connection issue
+- VE.Direct cable disconnected
+- Battery monitor device powered off
+- USB device enumeration changed
+
+The system will continue attempting to reconnect automatically.
+If this persists beyond {COMM_FAILURE_CRITICAL_MINUTES} minutes, immediate attention will be required.
+
+Monitor the situation and check connections if convenient.
+                """
+                
+                if self.send_email_notification(subject, message):
+                    self.last_email_comm_failure = now
+                    self.comm_failure_sent = True
+        
+        # Recovery notification
+        elif self.comm_failure_sent and minutes_since_last_read < 2:  # Communication restored
+            subject = f"Battery Monitor Communication Restored"
+            message = f"""
+Communication Recovery
+
+Your RV battery monitoring system has successfully restored communication.
+
+Recovery Details:
+- Communication restored at: {datetime.fromtimestamp(self.last_successful_voltage_read).strftime('%Y-%m-%d %H:%M:%S')}
+- Outage duration: {minutes_since_last_read:.1f} minutes
+- Current voltage: {self.last_voltage:.2f}V
+- System status: Operational
+
+All monitoring and safety features have been restored.
+Normal battery monitoring operation has resumed.
+            """
+            
+            if self.send_email_notification(subject, message):
+                self.comm_failure_sent = False  # Reset flag after recovery
         
     def control_charger(self, should_connect, reason):
         """Control charger connection via relay"""
@@ -981,7 +1149,7 @@ System has returned to normal charging operation.
             f"Solar: {'Active' if self.solar_detected else 'Inactive'} | "
             f"Rate: {current_rate:.1f}¢/kWh ({rate_type}) | "
             f"EV Credit: {'Yes' if has_ev_credit else 'No'} | "
-            f"Season: {self.get_current_season().title()}"
+            f"Season: {self.get_monthly_season_name()} (Solar: {self.get_solar_factor():.0%})"
         )
         
         logging.info(status_msg)
@@ -996,7 +1164,7 @@ System has returned to normal charging operation.
         logging.info(f"⏰ Preferred hours: {PREFERRED_CHARGING_HOURS}")
         logging.info(f"🚫 Peak avoid hours: {AVOID_CHARGING_HOURS}")
         logging.info(f"☀️ Solar detection: {'Enabled' if SOLAR_DETECTION_ENABLED else 'Disabled'}")
-        logging.info(f"📅 Current season: {self.get_current_season().title()}")
+        logging.info(f"📅 Current season: {self.get_monthly_season_name()} (Solar factor: {self.get_solar_factor():.0%}, Daylight: {self.get_monthly_daylight_hours()[0]}:00-{self.get_monthly_daylight_hours()[1]}:00)")
         
         try:
             while True:
@@ -1005,6 +1173,9 @@ System has returned to normal charging operation.
                 if voltage is not None:
                     # Check for voltage alerts and send emails if needed
                     self.check_voltage_alerts(voltage)
+                    
+                    # Check for communication failures
+                    self.check_communication_failure()
                     
                     # Detect solar activity
                     self.detect_solar_charging()
@@ -1036,6 +1207,8 @@ System has returned to normal charging operation.
                     
                 else:
                     logging.warning("Failed to read voltage - maintaining current state")
+                    # Check for prolonged communication failures even when voltage read fails
+                    self.check_communication_failure()
                     
                 time.sleep(MONITOR_INTERVAL)
                 

@@ -20,11 +20,11 @@ LOG_INTERVAL = 300             # Seconds between detailed log entries (5 minutes
 # Time-of-Day Charging Schedule based on your utility rates
 # Format: (start_hour, end_hour) in 24-hour format
 
-# PREFERRED charging times (lowest cost + EV credit + solar)
+# PREFERRED charging times (prioritize cheapest rates and solar)
 PREFERRED_CHARGING_HOURS = [
-    (0, 6),    # Midnight - 6 AM (EV credit -$0.0150/kWh + off-peak rates)
-    (10, 17),  # 10 AM - 5 PM (solar generation + mid-peak rates, avoid peak)
-    (20, 24),  # 8 PM - Midnight (off-peak rates resume)
+    (0, 6),    # Midnight - 6 AM (EV credit -$0.0150/kWh + off-peak rates) - CHEAPEST
+    (10, 17),  # 10 AM - 5 PM (solar generation window - avoid mid-peak when possible)
+    # Removed 8PM-midnight: Better to wait for EV credit period for cheaper rates
 ]
 
 # PEAK hours - avoid charging (highest cost $0.3655 summer / $0.1724 winter)
@@ -32,9 +32,26 @@ AVOID_CHARGING_HOURS = [
     (17, 20),  # 5 PM - 8 PM (peak rates - most expensive)
 ]
 
-# Seasonal rate adjustments
-SUMMER_SEASON = (6, 9)  # June 1 - September 30 (months 6-9)
-WINTER_SEASON = (10, 5)  # October 1 - May 31 (months 10-12, 1-5)
+# Granular seasonal solar adjustments based on daylight hours and solar intensity
+# Each month gets specific solar generation expectations and daylight hours
+MONTHLY_SOLAR_PROFILE = {
+    1:  {'name': 'Deep Winter',    'solar_factor': 0.25, 'daylight': (8, 17)},   # January - very low sun
+    2:  {'name': 'Late Winter',    'solar_factor': 0.35, 'daylight': (7, 18)},   # February - still low
+    3:  {'name': 'Early Spring',   'solar_factor': 0.55, 'daylight': (7, 18)},   # March - improving
+    4:  {'name': 'Mid Spring',     'solar_factor': 0.75, 'daylight': (6, 19)},   # April - much better
+    5:  {'name': 'Late Spring',    'solar_factor': 0.90, 'daylight': (6, 20)},   # May - very good
+    6:  {'name': 'Early Summer',   'solar_factor': 1.00, 'daylight': (5, 20)},   # June - peak
+    7:  {'name': 'Peak Summer',    'solar_factor': 1.00, 'daylight': (5, 20)},   # July - peak
+    8:  {'name': 'Late Summer',    'solar_factor': 0.95, 'daylight': (6, 19)},   # August - still excellent
+    9:  {'name': 'Early Fall',     'solar_factor': 0.80, 'daylight': (7, 18)},   # September - good
+    10: {'name': 'Mid Fall',       'solar_factor': 0.60, 'daylight': (7, 17)},   # October - declining
+    11: {'name': 'Late Fall',      'solar_factor': 0.40, 'daylight': (8, 17)},   # November - poor
+    12: {'name': 'Early Winter',   'solar_factor': 0.20, 'daylight': (8, 17)},   # December - worst
+}
+
+# Legacy season mapping for utility rate structure (still needed for billing)
+SUMMER_SEASON = (6, 9)  # June 1 - September 30 (months 6-9) - for utility rates
+WINTER_SEASON = (10, 5)  # October 1 - May 31 (months 10-12, 1-5) - for utility rates
 
 # Rate information for logging/analysis (cents per kWh) - Updated Oct 2025
 RATE_INFO = {
@@ -71,12 +88,13 @@ SOLAR_DETECTION_METHODS = {
     'load_compensation': True,      # Account for system load patterns
 }
 
-# Time-based solar detection (backup method)
+# Time-based solar detection now uses monthly profiles above
+# Legacy fallback for compatibility
 SOLAR_DAYLIGHT_HOURS = {
-    'summer': (7, 19),     # 7 AM - 7 PM in summer
-    'winter': (8, 17),     # 8 AM - 5 PM in winter  
-    'spring': (7, 18),     # 7 AM - 6 PM in spring
-    'fall': (8, 17),       # 8 AM - 5 PM in fall
+    'summer': (6, 20),     # Peak summer daylight
+    'winter': (8, 17),     # Deep winter daylight  
+    'spring': (7, 18),     # Spring average
+    'fall': (7, 17),       # Fall average
 }
 
 # System Specifications

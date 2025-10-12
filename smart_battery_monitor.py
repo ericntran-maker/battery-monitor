@@ -533,9 +533,13 @@ class SmartBatteryMonitor:
         
     def should_charge(self, voltage):
         """Determine if charging should be enabled based on voltage priority and other factors"""
-        # Safety first - always disconnect if voltage too high
+        # Safety first - always disconnect if voltage too high (ABSOLUTE PRIORITY)
         if voltage >= VOLTAGE_THRESHOLD_HIGH:
             return False, "SAFETY_HIGH_VOLTAGE"
+            
+        # Hysteresis for high voltage - stay disconnected until voltage drops significantly
+        if not self.charger_connected and voltage >= VOLTAGE_THRESHOLD_LOW:
+            return False, "SAFETY_HIGH_VOLTAGE_HYSTERESIS"
             
         # CRITICAL: Inverter protection - always charge if approaching cutoff
         if voltage <= CRITICAL_VOLTAGE_THRESHOLD:
@@ -546,18 +550,18 @@ class SmartBatteryMonitor:
             return True, "EMERGENCY_LOW_VOLTAGE"
             
         # Low voltage priority - prefer charging even during peak hours
-        if voltage <= LOW_VOLTAGE_PRIORITY_THRESHOLD:
+        if voltage <= LOW_VOLTAGE_PRIORITY_THRESHOLD:  # 21.2V
             # Only avoid charging during peak if voltage is not too low AND solar isn't active
             if self.is_avoid_charging_time() and not self.solar_detected:
                 # Still charge during peak if voltage is getting concerning
-                if voltage <= (LOW_VOLTAGE_PRIORITY_THRESHOLD - 0.2):  # 22.8V
+                if voltage <= (LOW_VOLTAGE_PRIORITY_THRESHOLD - 0.2):  # 21.0V
                     return True, "LOW_VOLTAGE_OVERRIDE_PEAK"
                 else:
                     return False, "LOW_VOLTAGE_PEAK_AVOIDANCE"
             else:
                 return True, "LOW_VOLTAGE_PRIORITY"
         
-        # Solar is active - prefer charging during solar hours (HIGH PRIORITY)
+        # Solar is active - prefer charging during solar hours (but respect safety limits)
         if self.solar_detected:
             return True, "SOLAR_ACTIVE"
         
@@ -577,21 +581,36 @@ class SmartBatteryMonitor:
                 else:
                     return False, "VOLTAGE_HIGH_SKIP_PREFERRED"
             
-            # Weekend logic - only charge if voltage warrants it
+            # Weekend logic - only charge if voltage warrants it (with hysteresis)
             if self.is_weekend_or_holiday():
-                # On weekends, only charge if voltage is getting low
-                if voltage <= 22.5:  # Lower threshold for weekend charging
-                    return True, "WEEKEND_LOW_VOLTAGE"
+                if self.charger_connected:
+                    # If currently charging, keep charging until voltage gets higher
+                    if voltage < 22.0:  # Higher threshold to stop charging
+                        return True, "WEEKEND_LOW_VOLTAGE"
+                    else:
+                        return False, "WEEKEND_WAIT_FOR_EV_CREDIT"
                 else:
-                    return False, "WEEKEND_WAIT_FOR_EV_CREDIT"
+                    # If currently not charging, only start if voltage is lower
+                    if voltage <= 21.2:  # Lower threshold to start charging (matches LOW_VOLTAGE_PRIORITY)
+                        return True, "WEEKEND_LOW_VOLTAGE"
+                    else:
+                        return False, "WEEKEND_WAIT_FOR_EV_CREDIT"
             
-            # Daylight hours (potential solar) - charge if voltage reasonable
+            # Daylight hours (potential solar) - charge if voltage reasonable (with hysteresis)
             start_hour, end_hour = self.get_monthly_daylight_hours()
             if start_hour <= current_hour < end_hour:
-                if voltage < 23.2:  # Slightly lower threshold for daylight
-                    return True, "DAYLIGHT_HOURS_POTENTIAL_SOLAR"
+                if self.charger_connected:
+                    # Keep charging until higher voltage
+                    if voltage < 23.5:
+                        return True, "DAYLIGHT_HOURS_POTENTIAL_SOLAR"
+                    else:
+                        return False, "VOLTAGE_HIGH_SKIP_DAYLIGHT"
                 else:
-                    return False, "VOLTAGE_HIGH_SKIP_DAYLIGHT"
+                    # Start charging at lower voltage
+                    if voltage <= 23.0:
+                        return True, "DAYLIGHT_HOURS_POTENTIAL_SOLAR"
+                    else:
+                        return False, "VOLTAGE_HIGH_SKIP_DAYLIGHT"
             
             # Peak avoidance hours (5PM-8PM) - be conservative
             if self.is_avoid_charging_time():

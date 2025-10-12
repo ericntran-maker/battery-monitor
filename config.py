@@ -9,8 +9,8 @@ SERIAL_PORTS = ["/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2", "/dev/ttyUSB3"] 
 BAUD_RATE = 19200
 
 # Voltage Thresholds
-VOLTAGE_THRESHOLD_HIGH = 24.5  # Disconnect charger above this (safety)
-VOLTAGE_THRESHOLD_LOW = 24.1   # Reconnect charger below this (hysteresis)
+VOLTAGE_THRESHOLD_HIGH = 24.8  # Disconnect charger above this (safety) - accounts for 1kW charging boost
+VOLTAGE_THRESHOLD_LOW = 23.5   # Reconnect charger below this (hysteresis) - resting voltage
 VOLTAGE_SOLAR_DETECT = 23.0    # Voltage above which we assume solar is active
 
 # Monitoring Settings
@@ -72,7 +72,7 @@ RATE_INFO = {
 INVERTER_CUTOFF_VOLTAGE = 20.3          # Your inverter shuts off at 20.3V
 CRITICAL_VOLTAGE_THRESHOLD = 20.6       # Start aggressive charging at 20.6V
 EMERGENCY_VOLTAGE_THRESHOLD = 21.0      # Always charge below 21.0V regardless of rates
-LOW_VOLTAGE_PRIORITY_THRESHOLD = 22.0   # Prefer charging below 22.0V even during peak hours
+LOW_VOLTAGE_PRIORITY_THRESHOLD = 21.2   # Prefer charging below 21.2V even during peak hours
 NORMAL_VOLTAGE_THRESHOLD = 23.5         # Normal operation above 23.5V
 
 # Solar Detection Settings

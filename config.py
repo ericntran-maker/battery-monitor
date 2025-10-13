@@ -3,6 +3,20 @@
 Configuration file for battery monitor with time-of-day optimization
 """
 
+# Camping Mode - Date Range Configuration
+# Format: (start_date, end_date, voltage_threshold)
+CAMPING_PERIODS = [
+    # Example camping periods - modify as needed
+    # ("2025-10-15", "2025-10-22", 24.6),  # Week camping trip
+    # ("2025-11-28", "2025-12-02", 24.5),  # Thanksgiving weekend  
+    # ("2025-12-20", "2026-01-05", 24.7),  # Holiday camping
+    
+    # Uncomment and modify dates as needed for your camping trips
+]
+
+# Default camping voltage threshold if not specified
+DEFAULT_CAMPING_VOLTAGE = 24.6
+
 # Hardware Configuration
 RELAY_PIN = 17
 SERIAL_PORTS = ["/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2", "/dev/ttyUSB3"]  # Try USB devices 0-3
@@ -14,7 +28,7 @@ VOLTAGE_THRESHOLD_LOW = 23.5   # Reconnect charger below this (hysteresis) - res
 VOLTAGE_SOLAR_DETECT = 23.0    # Voltage above which we assume solar is active
 
 # Monitoring Settings
-MONITOR_INTERVAL = 30          # Seconds between voltage checks (increased for time-based)
+MONITOR_INTERVAL = 60          # Seconds between voltage checks (increased for time-based)
 LOG_INTERVAL = 300             # Seconds between detailed log entries (5 minutes)
 
 # Time-of-Day Charging Schedule based on your utility rates

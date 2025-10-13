@@ -530,9 +530,54 @@ class SmartBatteryMonitor:
                     return True
                     
         return False
+    
+    def is_camping_period(self):
+        """Check if current date falls within any camping period"""
+        from datetime import datetime, date
+        
+        if not CAMPING_PERIODS:
+            return False, None
+            
+        today = date.today()
+        
+        for period in CAMPING_PERIODS:
+            if len(period) == 3:
+                start_str, end_str, voltage_threshold = period
+            else:
+                # Handle case where voltage threshold is not specified
+                start_str, end_str = period[:2]
+                voltage_threshold = DEFAULT_CAMPING_VOLTAGE
+            
+            try:
+                start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
+                end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
+                
+                if start_date <= today <= end_date:
+                    return True, voltage_threshold
+            except ValueError as e:
+                logging.warning(f"Invalid camping period date format: {period} - {e}")
+                continue
+        
+        return False, None
+    
+    def _camping_mode_logic(self, voltage, threshold):
+        """Simple camping logic - only disconnect on high voltage"""
+        # Disconnect if voltage too high (prevent overcharge)
+        if voltage >= threshold:
+            return False, f"CAMPING_HIGH_VOLTAGE_{threshold}V"
+        
+        # Otherwise, always allow charging (let solar/generator charge freely)
+        return True, "CAMPING_ALLOW_CHARGING"
         
     def should_charge(self, voltage):
         """Determine if charging should be enabled based on voltage priority and other factors"""
+        
+        # Check if we're in a camping period
+        is_camping, camping_voltage = self.is_camping_period()
+        if is_camping:
+            return self._camping_mode_logic(voltage, camping_voltage)
+        
+        # NORMAL MODE - Full smart charging logic
         # Safety first - always disconnect if voltage too high (ABSOLUTE PRIORITY)
         if voltage >= VOLTAGE_THRESHOLD_HIGH:
             return False, "SAFETY_HIGH_VOLTAGE"
@@ -1175,15 +1220,59 @@ Normal battery monitoring operation has resumed.
         
     def monitor_loop(self):
         """Main monitoring loop with smart charging logic"""
-        logging.info("🚀 Starting Smart Battery Monitor with TOD Optimization...")
-        logging.info(f"🔋 Battery System: {BATTERY_CAPACITY_KWH}kWh, {TYPICAL_LOAD_KW}kW typical load")
-        logging.info(f"⚡ Inverter cutoff: {INVERTER_CUTOFF_VOLTAGE}V")
-        logging.info(f"🚨 Voltage thresholds: Critical={CRITICAL_VOLTAGE_THRESHOLD}V, Emergency={EMERGENCY_VOLTAGE_THRESHOLD}V")
-        logging.info(f"🔧 Safety thresholds: High={VOLTAGE_THRESHOLD_HIGH}V, Low={VOLTAGE_THRESHOLD_LOW}V")
-        logging.info(f"⏰ Preferred hours: {PREFERRED_CHARGING_HOURS}")
-        logging.info(f"🚫 Peak avoid hours: {AVOID_CHARGING_HOURS}")
-        logging.info(f"☀️ Solar detection: {'Enabled' if SOLAR_DETECTION_ENABLED else 'Disabled'}")
-        logging.info(f"📅 Current season: {self.get_monthly_season_name()} (Solar factor: {self.get_solar_factor():.0%}, Daylight: {self.get_monthly_daylight_hours()[0]}:00-{self.get_monthly_daylight_hours()[1]}:00)")
+        
+        # Check camping mode status
+        is_camping, camping_voltage = self.is_camping_period()
+        
+        if is_camping:
+            logging.info(f"🏕️ CAMPING MODE ACTIVE - Threshold: {camping_voltage}V")
+            logging.info(f"🔋 Battery System: {BATTERY_CAPACITY_KWH}kWh, {TYPICAL_LOAD_KW}kW typical load")
+            logging.info(f"⚡ Inverter cutoff: {INVERTER_CUTOFF_VOLTAGE}V")
+            logging.info("📵 All smart charging features DISABLED - Simple high voltage protection only")
+            
+            # Show upcoming camping periods
+            if len(CAMPING_PERIODS) > 1:
+                from datetime import datetime, date
+                today = date.today()
+                upcoming = []
+                for period in CAMPING_PERIODS:
+                    start_str, end_str = period[:2]
+                    try:
+                        start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
+                        end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
+                        if start_date > today:
+                            upcoming.append(f"{start_str} to {end_str}")
+                    except ValueError:
+                        continue
+                if upcoming:
+                    logging.info(f"📅 Upcoming camping periods: {', '.join(upcoming[:2])}")
+        else:
+            logging.info("🚀 Starting Smart Battery Monitor with TOD Optimization...")
+            logging.info(f"🔋 Battery System: {BATTERY_CAPACITY_KWH}kWh, {TYPICAL_LOAD_KW}kW typical load")
+            logging.info(f"⚡ Inverter cutoff: {INVERTER_CUTOFF_VOLTAGE}V")
+            logging.info(f"🚨 Voltage thresholds: Critical={CRITICAL_VOLTAGE_THRESHOLD}V, Emergency={EMERGENCY_VOLTAGE_THRESHOLD}V")
+            logging.info(f"🔧 Safety thresholds: High={VOLTAGE_THRESHOLD_HIGH}V, Low={VOLTAGE_THRESHOLD_LOW}V")
+            logging.info(f"⏰ Preferred hours: {PREFERRED_CHARGING_HOURS}")
+            logging.info(f"🚫 Peak avoid hours: {AVOID_CHARGING_HOURS}")
+            logging.info(f"☀️ Solar detection: {'Enabled' if SOLAR_DETECTION_ENABLED else 'Disabled'}")
+            logging.info(f"📅 Current season: {self.get_monthly_season_name()} (Solar factor: {self.get_solar_factor():.0%}, Daylight: {self.get_monthly_daylight_hours()[0]}:00-{self.get_monthly_daylight_hours()[1]}:00)")
+            
+            # Show next camping period if any
+            if CAMPING_PERIODS:
+                from datetime import datetime, date
+                today = date.today()
+                next_camping = None
+                for period in CAMPING_PERIODS:
+                    start_str, end_str = period[:2]
+                    try:
+                        start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
+                        if start_date > today:
+                            if next_camping is None or start_date < next_camping[0]:
+                                next_camping = (start_date, start_str, end_str)
+                    except ValueError:
+                        continue
+                if next_camping:
+                    logging.info(f"🏕️ Next camping period: {next_camping[1]} to {next_camping[2]}")
         
         try:
             while True:

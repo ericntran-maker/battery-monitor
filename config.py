@@ -19,6 +19,7 @@ DEFAULT_CAMPING_VOLTAGE = 24.6
 
 # Hardware Configuration
 RELAY_PIN = 17
+INVERTER_PIN = 27  # GPIO pin that controls inverter power
 SERIAL_PORTS = ["/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2", "/dev/ttyUSB3"]  # Try USB devices 0-3
 BAUD_RATE = 19200
 
@@ -34,6 +35,10 @@ LOG_INTERVAL = 300             # Seconds between detailed log entries (5 minutes
 # System Maintenance
 DAILY_REBOOT_ENABLED = True    # Enable daily reboot to prevent system lockups
 DAILY_REBOOT_HOUR = 6          # Hour to perform daily reboot (24-hour format)
+INVERTER_RESET_ENABLED = True  # Enable daily inverter reset to prevent failures
+INVERTER_RESET_HOUR = 23       # Hour to perform inverter reset (24-hour format)
+INVERTER_RESET_MINUTE = 55     # Minute to perform inverter reset
+INVERTER_RESET_DURATION = 8    # Seconds to keep inverter off during reset
 
 # Evening charging thresholds
 EVENING_EV_WAIT_THRESHOLD = 20.9    # Wait for EV credit if voltage above this during evening hours

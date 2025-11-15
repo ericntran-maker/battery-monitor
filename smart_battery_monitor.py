@@ -60,6 +60,9 @@ class SmartBatteryMonitor:
         self.last_successful_voltage_read = time.time()
         self.consecutive_read_failures = 0
         
+        # Inverter reset tracking
+        self.last_inverter_reset_date = None
+        
         # CSV logging setup
         if ENABLE_CSV_LOGGING:
             self.setup_csv_logging()
@@ -120,7 +123,8 @@ class SmartBatteryMonitor:
         """Initialize GPIO for relay control"""
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(RELAY_PIN, GPIO.OUT, initial=GPIO.LOW)  # Initialize as output, default to connected
-        logging.info("GPIO initialized")
+        GPIO.setup(INVERTER_PIN, GPIO.OUT, initial=GPIO.LOW)  # Initialize inverter pin, default to ON
+        logging.info("GPIO initialized (relay and inverter)")
     
     def read_relay_state(self):
         """Read the current relay state to determine if charger is connected"""
@@ -620,6 +624,44 @@ class SmartBatteryMonitor:
             logging.error(f"❌ Failed to execute reboot: {e}")
             # Continue running if reboot fails
             return
+    
+    def reset_inverter_if_needed(self):
+        """Reset inverter once per day at scheduled time to prevent failures"""
+        if not INVERTER_RESET_ENABLED:
+            return
+        
+        now = datetime.now()
+        current_date = now.date()
+        
+        # Check if we're in the reset time window and haven't reset today
+        if (now.hour == INVERTER_RESET_HOUR and 
+            now.minute >= INVERTER_RESET_MINUTE and 
+            now.minute < INVERTER_RESET_MINUTE + 5 and
+            self.last_inverter_reset_date != current_date):
+            
+            current_time = now.strftime("%Y-%m-%d %H:%M:%S")
+            logging.info(f"🔄 INVERTER RESET: Daily maintenance reset at {current_time}")
+            
+            try:
+                # Turn inverter OFF (GPIO.HIGH)
+                logging.info(f"⚡ Turning inverter OFF for {INVERTER_RESET_DURATION} seconds...")
+                GPIO.output(INVERTER_PIN, GPIO.HIGH)
+                time.sleep(INVERTER_RESET_DURATION)
+                
+                # Turn inverter back ON (GPIO.LOW)
+                GPIO.output(INVERTER_PIN, GPIO.LOW)
+                logging.info("✅ Inverter reset complete - inverter is now ON")
+                
+                # Mark that we've reset today
+                self.last_inverter_reset_date = current_date
+                
+            except Exception as e:
+                logging.error(f"❌ Failed to reset inverter: {e}")
+                # Ensure inverter is back ON even if error occurred
+                try:
+                    GPIO.output(INVERTER_PIN, GPIO.LOW)
+                except:
+                    pass
     
     def _camping_mode_logic(self, voltage, threshold):
         """Simple camping logic with hysteresis"""
@@ -1488,6 +1530,9 @@ This alert will not repeat for 1 hour to avoid spam.
                     # Detect solar activity
                     self.detect_solar_charging()
                     
+                    # Check if inverter needs daily reset
+                    self.reset_inverter_if_needed()
+                    
                     # Get current rate info
                     rate_type, current_rate, has_ev_credit = self.get_current_rate_info()
                     
@@ -1530,10 +1575,11 @@ This alert will not repeat for 1 hour to avoid spam.
     def cleanup(self):
         """Clean up GPIO and serial connections"""
         try:
-            # Force charger connection before cleanup
-            logging.info("Cleanup starting - forcing charger connection")
+            # Force charger connection and inverter ON before cleanup
+            logging.info("Cleanup starting - forcing charger connection and inverter ON")
             GPIO.output(RELAY_PIN, GPIO.LOW)  # Ensure charger connected
-            logging.info("Charger relay set to connected state")
+            GPIO.output(INVERTER_PIN, GPIO.LOW)  # Ensure inverter ON
+            logging.info("Charger relay set to connected state, inverter set to ON")
             
             # Clean up GPIO
             GPIO.cleanup()
@@ -1547,13 +1593,15 @@ This alert will not repeat for 1 hour to avoid spam.
             logging.info("Cleanup completed successfully - Charger connected")
         except Exception as e:
             logging.error(f"Cleanup error: {e}")
-            # Try to force charger connection even if other cleanup fails
+            # Try to force charger connection and inverter ON even if other cleanup fails
             try:
                 import RPi.GPIO as GPIO
                 GPIO.setmode(GPIO.BCM)
                 GPIO.setup(RELAY_PIN, GPIO.OUT)
+                GPIO.setup(INVERTER_PIN, GPIO.OUT)
                 GPIO.output(RELAY_PIN, GPIO.LOW)
-                logging.info("Emergency charger connection successful")
+                GPIO.output(INVERTER_PIN, GPIO.LOW)
+                logging.info("Emergency charger connection and inverter ON successful")
             except Exception as e2:
                 logging.error(f"Emergency charger connection failed: {e2}")
 

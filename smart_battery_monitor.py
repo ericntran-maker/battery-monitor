@@ -1604,9 +1604,64 @@ This alert will not repeat for 1 hour to avoid spam.
                 logging.info("Emergency charger connection and inverter ON successful")
             except Exception as e2:
                 logging.error(f"Emergency charger connection failed: {e2}")
+    
+    def test_inverter_reset(self):
+        """Test the inverter reset functionality"""
+        logging.info("🧪 TESTING INVERTER RESET")
+        logging.info(f"📍 Inverter pin: GPIO {INVERTER_PIN}")
+        logging.info(f"⏱️  Reset duration: {INVERTER_RESET_DURATION} seconds")
+        
+        try:
+            # Ensure inverter is ON first
+            GPIO.output(INVERTER_PIN, GPIO.LOW)
+            logging.info("✅ Inverter is currently ON (GPIO.LOW)")
+            time.sleep(2)
+            
+            # Turn inverter OFF
+            logging.info(f"⚡ Turning inverter OFF for {INVERTER_RESET_DURATION} seconds...")
+            GPIO.output(INVERTER_PIN, GPIO.HIGH)
+            
+            # Count down
+            for i in range(INVERTER_RESET_DURATION):
+                logging.info(f"   Inverter OFF: {i+1}/{INVERTER_RESET_DURATION} seconds")
+                time.sleep(1)
+            
+            # Turn inverter back ON
+            logging.info("✅ Turning inverter back ON...")
+            GPIO.output(INVERTER_PIN, GPIO.LOW)
+            
+            logging.info("✅ TEST COMPLETE - Inverter reset successful!")
+            logging.info("📊 Inverter is now ON (GPIO.LOW)")
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"❌ Test failed: {e}")
+            # Ensure inverter is back ON even if test fails
+            try:
+                GPIO.output(INVERTER_PIN, GPIO.LOW)
+                logging.info("🔧 Emergency recovery: Inverter set to ON")
+            except:
+                pass
+            return False
 
 def main():
     """Main function"""
+    import sys
+    
+    # Check for test mode
+    if len(sys.argv) > 1 and sys.argv[1] == "test-inverter":
+        try:
+            logging.info("🧪 Starting inverter reset test mode...")
+            monitor = SmartBatteryMonitor()
+            success = monitor.test_inverter_reset()
+            monitor.cleanup()
+            sys.exit(0 if success else 1)
+        except Exception as e:
+            logging.error(f"Failed to run inverter test: {e}")
+            sys.exit(1)
+    
+    # Normal operation
     try:
         monitor = SmartBatteryMonitor()
         monitor.monitor_loop()

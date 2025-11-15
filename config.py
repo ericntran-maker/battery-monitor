@@ -23,13 +23,20 @@ SERIAL_PORTS = ["/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2", "/dev/ttyUSB3"] 
 BAUD_RATE = 19200
 
 # Voltage Thresholds
-VOLTAGE_THRESHOLD_HIGH = 24.8  # Disconnect charger above this (safety) - accounts for 1kW charging boost
+VOLTAGE_THRESHOLD_HIGH = 24.85  # Disconnect charger above this (safety) - accounts for 1kW charging boost
 VOLTAGE_THRESHOLD_LOW = 23.5   # Reconnect charger below this (hysteresis) - resting voltage
-VOLTAGE_SOLAR_DETECT = 23.0    # Voltage above which we assume solar is active
+VOLTAGE_HEALTHY_THRESHOLD = 23.0    # Voltage above which battery is considered healthy enough to wait for better rates
 
 # Monitoring Settings
 MONITOR_INTERVAL = 60          # Seconds between voltage checks (increased for time-based)
 LOG_INTERVAL = 300             # Seconds between detailed log entries (5 minutes)
+
+# System Maintenance
+DAILY_REBOOT_ENABLED = True    # Enable daily reboot to prevent system lockups
+DAILY_REBOOT_HOUR = 6          # Hour to perform daily reboot (24-hour format)
+
+# Evening charging thresholds
+EVENING_EV_WAIT_THRESHOLD = 20.9    # Wait for EV credit if voltage above this during evening hours
 
 # Time-of-Day Charging Schedule based on your utility rates
 # Format: (start_hour, end_hour) in 24-hour format
@@ -49,18 +56,18 @@ AVOID_CHARGING_HOURS = [
 # Granular seasonal solar adjustments based on daylight hours and solar intensity
 # Each month gets specific solar generation expectations and daylight hours
 MONTHLY_SOLAR_PROFILE = {
-    1:  {'name': 'Deep Winter',    'solar_factor': 0.25, 'daylight': (8, 17)},   # January - very low sun
-    2:  {'name': 'Late Winter',    'solar_factor': 0.35, 'daylight': (7, 18)},   # February - still low
-    3:  {'name': 'Early Spring',   'solar_factor': 0.55, 'daylight': (7, 18)},   # March - improving
-    4:  {'name': 'Mid Spring',     'solar_factor': 0.75, 'daylight': (6, 19)},   # April - much better
-    5:  {'name': 'Late Spring',    'solar_factor': 0.90, 'daylight': (6, 20)},   # May - very good
-    6:  {'name': 'Early Summer',   'solar_factor': 1.00, 'daylight': (5, 20)},   # June - peak
-    7:  {'name': 'Peak Summer',    'solar_factor': 1.00, 'daylight': (5, 20)},   # July - peak
-    8:  {'name': 'Late Summer',    'solar_factor': 0.95, 'daylight': (6, 19)},   # August - still excellent
-    9:  {'name': 'Early Fall',     'solar_factor': 0.80, 'daylight': (7, 18)},   # September - good
-    10: {'name': 'Mid Fall',       'solar_factor': 0.60, 'daylight': (7, 17)},   # October - declining
-    11: {'name': 'Late Fall',      'solar_factor': 0.40, 'daylight': (8, 17)},   # November - poor
-    12: {'name': 'Early Winter',   'solar_factor': 0.20, 'daylight': (8, 17)},   # December - worst
+    1:  {'name': 'Deep Winter',    'solar_factor': 0.25, 'daylight': (10, 16)},   # January - very low sun, late sunrise
+    2:  {'name': 'Late Winter',    'solar_factor': 0.35, 'daylight': (9, 17)},   # February - still low, improving
+    3:  {'name': 'Early Spring',   'solar_factor': 0.55, 'daylight': (8, 18)},   # March - improving, DST starts
+    4:  {'name': 'Mid Spring',     'solar_factor': 0.75, 'daylight': (7, 19)},   # April - much better, longer days
+    5:  {'name': 'Late Spring',    'solar_factor': 0.90, 'daylight': (6, 19)},   # May - very good, peak approaching
+    6:  {'name': 'Early Summer',   'solar_factor': 1.00, 'daylight': (6, 20)},   # June - peak, longest days
+    7:  {'name': 'Peak Summer',    'solar_factor': 1.00, 'daylight': (6, 20)},   # July - peak, still long days
+    8:  {'name': 'Late Summer',    'solar_factor': 0.95, 'daylight': (7, 19)},   # August - excellent, days shortening
+    9:  {'name': 'Early Fall',     'solar_factor': 0.80, 'daylight': (8, 18)},   # September - good, noticeably shorter
+    10: {'name': 'Mid Fall',       'solar_factor': 0.60, 'daylight': (10, 17)},   # October - declining, DST ends
+    11: {'name': 'Late Fall',      'solar_factor': 0.40, 'daylight': (10, 16)},   # November - poor, much shorter
+    12: {'name': 'Early Winter',   'solar_factor': 0.20, 'daylight': (10, 16)},   # December - worst, shortest days
 }
 
 # Legacy season mapping for utility rate structure (still needed for billing)
@@ -84,10 +91,10 @@ RATE_INFO = {
 
 # Voltage-based charging priority (critical for inverter protection)
 INVERTER_CUTOFF_VOLTAGE = 20.3          # Your inverter shuts off at 20.3V
-CRITICAL_VOLTAGE_THRESHOLD = 20.6       # Start aggressive charging at 20.6V
-EMERGENCY_VOLTAGE_THRESHOLD = 21.0      # Always charge below 21.0V regardless of rates
-LOW_VOLTAGE_PRIORITY_THRESHOLD = 21.2   # Prefer charging below 21.2V even during peak hours
-NORMAL_VOLTAGE_THRESHOLD = 23.5         # Normal operation above 23.5V
+CRITICAL_VOLTAGE_THRESHOLD = 20.5      # Start aggressive charging at 20.6V
+EMERGENCY_VOLTAGE_THRESHOLD = 20.6      # Always charge below 21.0V regardless of rates
+LOW_VOLTAGE_PRIORITY_THRESHOLD = 20.7   # Prefer charging below 21.0V even during peak hours
+NORMAL_VOLTAGE_THRESHOLD = 24.85        # Normal operation above 24.0V (stop charging for EV credit/solar)
 
 # Solar Detection Settings
 SOLAR_DETECTION_ENABLED = True
@@ -135,8 +142,8 @@ EXPECTED_SOLAR_GENERATION_KW = 2.0       # Estimate your solar panel capacity (a
 
 # Email Notification Settings
 EMAIL_NOTIFICATIONS_ENABLED = True
-EMAIL_ALERT_VOLTAGE_THRESHOLD = 21.0     # Send email alert below 21.0V
-EMAIL_CRITICAL_VOLTAGE_THRESHOLD = 20.8  # Send urgent email below 20.8V
+EMAIL_ALERT_VOLTAGE_THRESHOLD = 20.3     # Send email alert below 20.3V (below EV wait threshold)
+EMAIL_CRITICAL_VOLTAGE_THRESHOLD = 20.1  # Send urgent email below 20.1V (near inverter cutoff)
 EMAIL_RECOVERY_VOLTAGE_THRESHOLD = 21.5  # Send recovery email when voltage recovers above 21.5V
 EMAIL_CRITICAL_HIGH_VOLTAGE_THRESHOLD = 25.0  # Send critical alert above 25.0V
 
@@ -161,7 +168,7 @@ ENABLE_CSV_LOGGING = True
 
 # Seasonal Adjustments (optional - can be expanded later)
 SEASONAL_ADJUSTMENTS = {
-    'winter': {'solar_hours': (11, 15)},  # Shorter solar window in winter
+    'winter': {'solar_hours': (10, 15)},  # Shorter solar window in winter
     'summer': {'solar_hours': (9, 17)},   # Longer solar window in summer
     'spring': {'solar_hours': (10, 16)},
     'fall': {'solar_hours': (10, 16)},

@@ -28,12 +28,17 @@ class SmartBatteryMonitor:
         self.setup_gpio()
         self.setup_serial()
         
-        # State tracking
-        self.charger_connected = True
+        # State tracking - read actual relay state instead of assuming
+        self.charger_connected = self.read_relay_state()
         self.last_voltage = 0.0
         self.voltage_history = deque(maxlen=int(SOLAR_DETECTION_WINDOW / MONITOR_INTERVAL))
         self.last_detailed_log = 0
         self.solar_detected = False
+        self.first_decision = True  # Flag to enforce strict thresholds on first decision
+        
+        # Charger toggle tracking (detect rapid oscillation)
+        self.charger_state_changes = deque(maxlen=10)  # Track last 10 state changes with timestamps
+        self.last_rapid_toggle_alert = None  # Track when we last sent rapid toggle alert
         
         # Email notification tracking
         self.last_email_alert = None
@@ -47,6 +52,9 @@ class SmartBatteryMonitor:
         self.voltage_high_sent = False
         self.voltage_critical_high_sent = False
         self.comm_failure_sent = False
+        
+        # Recovery notification flags - prevent multiple recovery emails
+        self.recovery_email_sent = False
         
         # Communication failure tracking
         self.last_successful_voltage_read = time.time()
@@ -111,9 +119,21 @@ class SmartBatteryMonitor:
     def setup_gpio(self):
         """Initialize GPIO for relay control"""
         GPIO.setmode(GPIO.BCM)
-        GPIO.setup(RELAY_PIN, GPIO.OUT)
-        GPIO.output(RELAY_PIN, GPIO.LOW)  # Start with charger connected
-        logging.info("GPIO initialized - Charger connected (relay OFF)")
+        GPIO.setup(RELAY_PIN, GPIO.OUT, initial=GPIO.LOW)  # Initialize as output, default to connected
+        logging.info("GPIO initialized")
+    
+    def read_relay_state(self):
+        """Read the current relay state to determine if charger is connected"""
+        try:
+            # GPIO.LOW = relay off = charger connected (normally closed relay)
+            # GPIO.HIGH = relay on = charger disconnected
+            state = GPIO.input(RELAY_PIN)
+            is_connected = (state == GPIO.LOW)
+            logging.info(f"Initial charger state detected: {'Connected' if is_connected else 'Disconnected'} (GPIO: {state})")
+            return is_connected
+        except Exception as e:
+            logging.warning(f"Could not read relay state, defaulting to connected: {e}")
+            return True  # Safe default
         
     def find_usb_device(self):
         """Find the first available USB serial device"""
@@ -221,8 +241,15 @@ class SmartBatteryMonitor:
             
     def detect_solar_charging(self):
         """Enhanced solar detection using multiple methods"""
-        if not SOLAR_DETECTION_ENABLED or len(self.voltage_history) < 5:
+        if not SOLAR_DETECTION_ENABLED:
             return False
+        
+        # If we don't have enough voltage history yet, use time-based detection as fallback
+        if len(self.voltage_history) < 5:
+            time_result = self._detect_solar_by_time()
+            if time_result:
+                self.solar_detected = time_result
+            return time_result
             
         try:
             solar_indicators = []
@@ -560,14 +587,54 @@ class SmartBatteryMonitor:
         
         return False, None
     
+    def schedule_reboot(self):
+        """Schedule a system reboot to prevent lockups"""
+        import subprocess
+        import sys
+        
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logging.info(f"🔄 SCHEDULED REBOOT: Daily maintenance reboot at {current_time}")
+        logging.info("💾 Saving final status before reboot...")
+        
+        # Log final system state
+        voltage = self.read_voltage()
+        if voltage:
+            logging.info(f"📊 Final voltage reading: {voltage:.2f}V")
+            logging.info(f"🔌 Final charger state: {'Connected' if self.charger_connected else 'Disconnected'}")
+        
+        # Schedule reboot immediately (now instead of +1 minute)
+        try:
+            logging.info("⏰ Executing system reboot NOW...")
+            # Flush all logs before reboot
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+            
+            # Execute reboot immediately
+            subprocess.run(['sudo', 'reboot'], check=False)
+            
+            # If we get here, reboot command was issued - exit the script
+            logging.info("✅ Reboot command issued, exiting script...")
+            sys.exit(0)
+            
+        except Exception as e:
+            logging.error(f"❌ Failed to execute reboot: {e}")
+            # Continue running if reboot fails
+            return
+    
     def _camping_mode_logic(self, voltage, threshold):
-        """Simple camping logic - only disconnect on high voltage"""
-        # Disconnect if voltage too high (prevent overcharge)
+        """Simple camping logic with hysteresis"""
+        # Hysteresis: Disconnect at threshold, reconnect 0.5V below
         if voltage >= threshold:
             return False, f"CAMPING_HIGH_VOLTAGE_{threshold}V"
-        
-        # Otherwise, always allow charging (let solar/generator charge freely)
-        return True, "CAMPING_ALLOW_CHARGING"
+        elif voltage <= (threshold - 0.5) or not self.charger_connected:
+            # Charge if below threshold or if already charging and not too high
+            return True, "CAMPING_ALLOW_CHARGING"
+        else:
+            # In hysteresis band - maintain current state
+            if self.charger_connected:
+                return True, "CAMPING_ALLOW_CHARGING"
+            else:
+                return False, f"CAMPING_HYSTERESIS_{threshold}V"
         
     def should_charge(self, voltage):
         """Determine if charging should be enabled based on voltage priority and other factors"""
@@ -593,66 +660,125 @@ class SmartBatteryMonitor:
         # Emergency charging - always charge if battery critically low
         if voltage <= EMERGENCY_VOLTAGE_THRESHOLD:
             return True, "EMERGENCY_LOW_VOLTAGE"
+        
+        # Get current hour for time-based logic
+        current_hour = datetime.now().hour
+        
+        # EV credit hours (12AM-6AM) - always charge (cheapest rates)
+        # But stop if voltage gets too high
+        if 0 <= current_hour < 6:
+            if voltage >= NORMAL_VOLTAGE_THRESHOLD:  # 23.5V - stop if fully charged
+                return False, "EV_CREDIT_VOLTAGE_HIGH"
+            return True, "EV_CREDIT_PRIORITY"
+        
+        # Solar is active - prefer charging during solar hours (but respect safety limits)
+        # Check this early to avoid conflicts with morning/evening logic
+        if self.solar_detected:
+            # Stop charging if voltage gets too high, even with solar
+            if voltage >= NORMAL_VOLTAGE_THRESHOLD:  # 23.5V
+                return False, "SOLAR_VOLTAGE_HIGH"
+            return True, "SOLAR_ACTIVE"
+        
+        # Morning after EV credit (6AM-10AM) - disconnect if voltage is healthy AND no solar
+        # This prevents continuing to charge at off-peak rates when voltage is already good
+        if 6 <= current_hour < 10:
+            # Hysteresis: Start at ≤20.7V, stop at ≥22.0V
+            if voltage <= LOW_VOLTAGE_PRIORITY_THRESHOLD:  # 20.7V
+                return True, "MORNING_LOW_VOLTAGE_CHARGE"
+            elif voltage >= (LOW_VOLTAGE_PRIORITY_THRESHOLD + 1.3):  # 22.0V
+                return False, "MORNING_WAIT_FOR_SOLAR"
+            else:
+                # In hysteresis band (20.7V - 22.0V) - maintain current state
+                if self.charger_connected:
+                    return True, "MORNING_LOW_VOLTAGE_CHARGE"
+                else:
+                    return False, "MORNING_WAIT_FOR_SOLAR"
+        
+        # Evening (8PM-11:59PM) - wait for EV credit unless voltage drops significantly
+        # This check must come BEFORE LOW_VOLTAGE_PRIORITY to enforce the wait threshold
+        # IMPORTANT: This completely overrides LOW_VOLTAGE_PRIORITY during evening hours
+        if 20 <= current_hour <= 23:
+            # Start charging: Only if voltage ≤ 20.5V
+            # Stop charging: When voltage ≥ 21.5V (1V hysteresis band)
+            
+            if voltage <= EVENING_EV_WAIT_THRESHOLD:  # 20.5V
+                # Voltage is low enough - charge
+                return True, "EVENING_LOW_VOLTAGE_CHARGE"
+            elif voltage >= (EVENING_EV_WAIT_THRESHOLD + 1.0):  # 21.5V
+                # Voltage is high enough - stop charging
+                return False, "WAITING_FOR_EV_CREDIT_PERIOD"
+            else:
+                # Voltage is in the hysteresis band (20.5V - 21.5V)
+                # On first decision after startup, enforce strict threshold
+                if self.first_decision:
+                    return False, "WAITING_FOR_EV_CREDIT_PERIOD"
+                # Otherwise, maintain current state to prevent toggling
+                if self.charger_connected:
+                    return True, "EVENING_LOW_VOLTAGE_CHARGE"
+                else:
+                    return False, "WAITING_FOR_EV_CREDIT_PERIOD"
             
         # Low voltage priority - prefer charging even during peak hours
-        if voltage <= LOW_VOLTAGE_PRIORITY_THRESHOLD:  # 21.2V
+        # Hysteresis: Start at ≤20.7V, stop at ≥22.0V
+        if voltage <= LOW_VOLTAGE_PRIORITY_THRESHOLD:  # 20.7V
             # Only avoid charging during peak if voltage is not too low AND solar isn't active
             if self.is_avoid_charging_time() and not self.solar_detected:
                 # Still charge during peak if voltage is getting concerning
-                if voltage <= (LOW_VOLTAGE_PRIORITY_THRESHOLD - 0.2):  # 21.0V
+                if voltage <= (LOW_VOLTAGE_PRIORITY_THRESHOLD - 0.2):  # 20.5V
                     return True, "LOW_VOLTAGE_OVERRIDE_PEAK"
                 else:
                     return False, "LOW_VOLTAGE_PEAK_AVOIDANCE"
             else:
                 return True, "LOW_VOLTAGE_PRIORITY"
+        elif voltage >= (LOW_VOLTAGE_PRIORITY_THRESHOLD + 1.3) and self.charger_connected:  # 22.0V
+            # Stop charging if voltage is high enough
+            return False, "LOW_VOLTAGE_CHARGED"
         
-        # Solar is active - prefer charging during solar hours (but respect safety limits)
-        if self.solar_detected:
-            return True, "SOLAR_ACTIVE"
+        # Daily reboot to prevent system lockups
+        # Check if it's the reboot hour (this will trigger once per day during the reboot hour)
+        if DAILY_REBOOT_ENABLED and current_hour == DAILY_REBOOT_HOUR and datetime.now().minute < 5:
+            # schedule_reboot() will exit the script after issuing reboot command
+            # This code will not return if reboot succeeds
+            self.schedule_reboot()
+            # If we get here, reboot failed - maintain current state
+            return self.charger_connected, "REBOOT_FAILED_MAINTAIN_STATE"
         
-        # Normal voltage operation - Smart time-based charging
-        current_hour = datetime.now().hour
+        # Weekend logic - applies regardless of voltage level (but still safe)
+        if self.is_weekend_or_holiday():
+            if self.charger_connected:
+                # If currently charging, keep charging until voltage gets higher
+                if voltage < (LOW_VOLTAGE_PRIORITY_THRESHOLD + 1.0):  # 22.0V - Higher threshold to stop charging
+                    return True, "WEEKEND_LOW_VOLTAGE"
+                else:
+                    return False, "WEEKEND_WAIT_FOR_EV_CREDIT"
+            else:
+                # If currently not charging, only start if voltage is lower
+                if voltage <= (LOW_VOLTAGE_PRIORITY_THRESHOLD + 0.2):  # 21.2V - Lower threshold to start charging
+                    return True, "WEEKEND_LOW_VOLTAGE"
+                else:
+                    return False, "WEEKEND_WAIT_FOR_EV_CREDIT"
         
         # If voltage is healthy (>21.5V), use smart charging logic
         if voltage > EMAIL_RECOVERY_VOLTAGE_THRESHOLD:  # 21.5V
-            # EV credit hours (12AM-6AM) - always charge (cheapest rates)
-            if 0 <= current_hour < 6:
-                return True, "EV_CREDIT_PRIORITY"
-            
             # Preferred charging hours (now only EV credit on weekends)
             if self.is_preferred_charging_time():
-                if voltage < 23.5:  # Don't overcharge during preferred hours
+                if voltage < NORMAL_VOLTAGE_THRESHOLD:  # 23.5V - Don't overcharge during preferred hours
                     return True, "PREFERRED_HOURS"
                 else:
                     return False, "VOLTAGE_HIGH_SKIP_PREFERRED"
-            
-            # Weekend logic - only charge if voltage warrants it (with hysteresis)
-            if self.is_weekend_or_holiday():
-                if self.charger_connected:
-                    # If currently charging, keep charging until voltage gets higher
-                    if voltage < 22.0:  # Higher threshold to stop charging
-                        return True, "WEEKEND_LOW_VOLTAGE"
-                    else:
-                        return False, "WEEKEND_WAIT_FOR_EV_CREDIT"
-                else:
-                    # If currently not charging, only start if voltage is lower
-                    if voltage <= 21.2:  # Lower threshold to start charging (matches LOW_VOLTAGE_PRIORITY)
-                        return True, "WEEKEND_LOW_VOLTAGE"
-                    else:
-                        return False, "WEEKEND_WAIT_FOR_EV_CREDIT"
             
             # Daylight hours (potential solar) - charge if voltage reasonable (with hysteresis)
             start_hour, end_hour = self.get_monthly_daylight_hours()
             if start_hour <= current_hour < end_hour:
                 if self.charger_connected:
                     # Keep charging until higher voltage
-                    if voltage < 23.5:
+                    if voltage < NORMAL_VOLTAGE_THRESHOLD:  # 23.5V
                         return True, "DAYLIGHT_HOURS_POTENTIAL_SOLAR"
                     else:
                         return False, "VOLTAGE_HIGH_SKIP_DAYLIGHT"
                 else:
                     # Start charging at lower voltage
-                    if voltage <= 23.0:
+                    if voltage <= VOLTAGE_HEALTHY_THRESHOLD:  # 23.0V
                         return True, "DAYLIGHT_HOURS_POTENTIAL_SOLAR"
                     else:
                         return False, "VOLTAGE_HIGH_SKIP_DAYLIGHT"
@@ -663,17 +789,17 @@ class SmartBatteryMonitor:
             
             # Evening (8PM-11:59PM) - wait for EV credit unless voltage drops significantly
             if 20 <= current_hour <= 23:
-                if voltage > 22.2:  # Lower threshold - be more willing to wait for EV credit
+                if voltage > (LOW_VOLTAGE_PRIORITY_THRESHOLD + 1.2):  # 22.2V - be more willing to wait for EV credit
                     return False, "WAITING_FOR_EV_CREDIT_PERIOD"
             
             # Default for healthy voltage - wait for better rates
-            if voltage > 23.0:
+            if voltage > VOLTAGE_HEALTHY_THRESHOLD:  # 23.0V - wait for better rates if voltage healthy
                 return False, "VOLTAGE_HEALTHY_WAIT_FOR_EV_CREDIT"
         
         # Hysteresis for charger state changes (prevent rapid toggling)
         if self.charger_connected:
             # If currently connected, only disconnect if voltage is high enough
-            if voltage > VOLTAGE_THRESHOLD_LOW:  # 24.1V
+            if voltage > VOLTAGE_THRESHOLD_LOW:  # 23.5V
                 return False, "HYSTERESIS_DISCONNECT"
         else:
             # If currently disconnected, only reconnect if voltage dropped significantly
@@ -901,6 +1027,7 @@ This voltage level requires immediate investigation and corrective action.
                 if self.send_email_notification(subject, message, is_critical=True):
                     self.last_email_critical_high = now
                     self.voltage_critical_high_sent = True
+                    self.recovery_email_sent = False  # Reset recovery flag for new alert
                     
         # Critical LOW voltage alert (most urgent)
         if voltage <= EMAIL_CRITICAL_VOLTAGE_THRESHOLD:
@@ -925,6 +1052,7 @@ Time until inverter shutdown: Approximately {((voltage - INVERTER_CUTOFF_VOLTAGE
                 if self.send_email_notification(subject, message, is_critical=True):
                     self.last_email_critical = now
                     self.voltage_critical_sent = True
+                    self.recovery_email_sent = False  # Reset recovery flag for new alert
                     
         # Regular low voltage alert (only if not already critical)
         elif voltage <= EMAIL_ALERT_VOLTAGE_THRESHOLD and voltage > EMAIL_CRITICAL_VOLTAGE_THRESHOLD:
@@ -952,6 +1080,7 @@ Recommended Actions:
                 if self.send_email_notification(subject, message):
                     self.last_email_alert = now
                     self.voltage_alert_sent = True
+                    self.recovery_email_sent = False  # Reset recovery flag for new alert
 
         # High voltage alert (safety threshold reached)
         elif voltage >= VOLTAGE_THRESHOLD_HIGH:
@@ -986,11 +1115,12 @@ Monitor voltage and ensure it stabilizes below {VOLTAGE_THRESHOLD_HIGH}V.
                 if self.send_email_notification(subject, message):
                     self.last_email_high_voltage = now
                     self.voltage_high_sent = True
+                    self.recovery_email_sent = False  # Reset recovery flag for new alert
                     
         # Recovery notification (for both low and high voltage alerts)
         elif EMAIL_RECOVERY_VOLTAGE_THRESHOLD <= voltage < VOLTAGE_THRESHOLD_HIGH:
-            # Recovery from low voltage alerts
-            if (self.voltage_alert_sent or self.voltage_critical_sent):
+            # Recovery from low voltage alerts - SEND ONLY ONCE
+            if (self.voltage_alert_sent or self.voltage_critical_sent) and not self.recovery_email_sent:
                 subject = f"Battery Recovery: RV Battery at {voltage:.2f}V"
                 message = f"""
 Battery Voltage Recovery
@@ -1003,13 +1133,13 @@ System is operating normally.
                 
                 if self.send_email_notification(subject, message):
                     self.last_email_recovery = now
-                    # Don't reset flags immediately - let cooldown period handle it
-                    # This prevents rapid successive emails if voltage fluctuates
-                    # self.voltage_alert_sent = False  # REMOVED: Let cooldown manage this
-                    # self.voltage_critical_sent = False  # REMOVED: Let cooldown manage this
+                    # Reset alert flags and mark recovery as sent
+                    self.voltage_alert_sent = False
+                    self.voltage_critical_sent = False
+                    self.recovery_email_sent = True
                     
-            # Recovery from critical high voltage alert
-            elif self.voltage_critical_high_sent:
+            # Recovery from critical high voltage alert - SEND ONLY ONCE
+            elif self.voltage_critical_high_sent and not self.recovery_email_sent:
                 subject = f"CRITICAL High Voltage Recovery: RV Battery at {voltage:.2f}V"
                 message = f"""
 CRITICAL High Voltage Recovery
@@ -1037,11 +1167,12 @@ System has returned to safer operation, but investigation is still recommended.
                 
                 if self.send_email_notification(subject, message):
                     self.last_email_recovery = now
-                    # Reset critical high voltage flag after recovery
+                    # Reset critical high voltage flag and mark recovery as sent
                     self.voltage_critical_high_sent = False
+                    self.recovery_email_sent = True
                     
-            # Recovery from regular high voltage alert
-            elif self.voltage_high_sent:
+            # Recovery from regular high voltage alert - SEND ONLY ONCE
+            elif self.voltage_high_sent and not self.recovery_email_sent:
                 subject = f"High Voltage Recovery: RV Battery at {voltage:.2f}V"
                 message = f"""
 High Voltage Recovery
@@ -1058,8 +1189,9 @@ System has returned to normal charging operation.
                 
                 if self.send_email_notification(subject, message):
                     self.last_email_recovery = now
-                    # Reset high voltage flag after cooldown
+                    # Reset high voltage flag and mark recovery as sent
                     self.voltage_high_sent = False
+                    self.recovery_email_sent = True
     
     def check_communication_failure(self):
         """Check for prolonged communication failures and send alerts"""
@@ -1169,15 +1301,83 @@ Normal battery monitoring operation has resumed.
         
     def control_charger(self, should_connect, reason):
         """Control charger connection via relay"""
+        # Clear first decision flag after first control decision
+        if self.first_decision:
+            self.first_decision = False
+            
         if should_connect and not self.charger_connected:
             GPIO.output(RELAY_PIN, GPIO.LOW)
             self.charger_connected = True
             logging.info(f"🟢 CHARGER CONNECTED - {reason}")
             
+            # Track state change
+            self.charger_state_changes.append((time.time(), 'connected', reason))
+            self.check_rapid_toggling()
+            
         elif not should_connect and self.charger_connected:
             GPIO.output(RELAY_PIN, GPIO.HIGH)
             self.charger_connected = False
             logging.warning(f"🔴 CHARGER DISCONNECTED - {reason}")
+            
+            # Track state change
+            self.charger_state_changes.append((time.time(), 'disconnected', reason))
+            self.check_rapid_toggling()
+    
+    def check_rapid_toggling(self):
+        """Check if charger is toggling too rapidly and send alert"""
+        if len(self.charger_state_changes) < 3:
+            return
+        
+        # Check if we have 3+ toggles within 5 minutes (300 seconds)
+        # With proper hysteresis, ANY rapid toggling indicates a logic problem
+        now = time.time()
+        recent_changes = [change for change in self.charger_state_changes if now - change[0] <= 300]
+        
+        if len(recent_changes) >= 3:
+            # Rapid toggling detected!
+            # Only send alert once per hour to avoid spam
+            if self.last_rapid_toggle_alert is None or (now - self.last_rapid_toggle_alert) > 3600:
+                self.last_rapid_toggle_alert = now
+                
+                # Build toggle history for email
+                toggle_history = []
+                for timestamp, state, reason in recent_changes:
+                    time_str = datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')
+                    toggle_history.append(f"  - {time_str}: {state.upper()} ({reason})")
+                
+                subject = f"⚠️ RAPID CHARGER TOGGLING DETECTED - {len(recent_changes)} changes in 5 minutes"
+                message = f"""
+RAPID CHARGER TOGGLING ALERT!
+
+Your battery charger has toggled {len(recent_changes)} times within the last 5 minutes.
+This indicates a LOGIC BUG - with proper hysteresis, rapid toggling should never occur.
+
+Recent Toggle History:
+{chr(10).join(toggle_history)}
+
+Current System Status:
+- Battery Voltage: {self.last_voltage:.2f}V
+- Charger Status: {'Connected' if self.charger_connected else 'Disconnected'}
+- Solar Status: {'Active' if self.solar_detected else 'Inactive'}
+- Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+Possible Causes:
+- Voltage hovering near threshold boundaries
+- Conflicting charging logic rules
+- Solar detection flickering on/off
+- Hysteresis bands too narrow
+
+Recommended Actions:
+- Review recent logs for pattern
+- Check voltage thresholds in config
+- Verify solar detection is stable
+- Consider adjusting hysteresis bands
+
+This alert will not repeat for 1 hour to avoid spam.
+                """
+                
+                logging.warning(f"⚠️ RAPID TOGGLING DETECTED: {len(recent_changes)} changes in 5 minutes")
+                self.send_email_notification(subject, message)
             
     def log_detailed_status(self, voltage):
         """Log detailed system status periodically"""

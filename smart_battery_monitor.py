@@ -1595,7 +1595,6 @@ This alert will not repeat for 1 hour to avoid spam.
             logging.error(f"Cleanup error: {e}")
             # Try to force charger connection and inverter ON even if other cleanup fails
             try:
-                import RPi.GPIO as GPIO
                 GPIO.setmode(GPIO.BCM)
                 GPIO.setup(RELAY_PIN, GPIO.OUT)
                 GPIO.setup(INVERTER_PIN, GPIO.OUT)
@@ -1629,9 +1628,11 @@ This alert will not repeat for 1 hour to avoid spam.
             # Turn inverter back ON
             logging.info("✅ Turning inverter back ON...")
             GPIO.output(INVERTER_PIN, GPIO.LOW)
+            time.sleep(2)  # Give inverter time to stabilize
             
             logging.info("✅ TEST COMPLETE - Inverter reset successful!")
             logging.info("📊 Inverter is now ON (GPIO.LOW)")
+            logging.info("⚠️  Note: GPIO pins will remain configured (no cleanup called)")
             
             return True
             
@@ -1655,10 +1656,19 @@ def main():
             logging.info("🧪 Starting inverter reset test mode...")
             monitor = SmartBatteryMonitor()
             success = monitor.test_inverter_reset()
-            monitor.cleanup()
+            # Don't call cleanup() - it would reset GPIO pins
+            # Just close serial connection
+            if hasattr(monitor, 'ser'):
+                monitor.ser.close()
+            logging.info("✅ Test complete - inverter remains ON, GPIO pins remain configured")
             sys.exit(0 if success else 1)
         except Exception as e:
             logging.error(f"Failed to run inverter test: {e}")
+            # Ensure inverter is ON before exit
+            try:
+                GPIO.output(INVERTER_PIN, GPIO.LOW)
+            except:
+                pass
             sys.exit(1)
     
     # Normal operation

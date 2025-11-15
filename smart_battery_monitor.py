@@ -63,6 +63,11 @@ class SmartBatteryMonitor:
         # Inverter reset tracking
         self.last_inverter_reset_date = None
         
+        # Charging failure detection tracking
+        self.ev_charging_start_time = None
+        self.ev_charging_start_voltage = None
+        self.last_charging_failure_alert = None
+        
         # CSV logging setup
         if ENABLE_CSV_LOGGING:
             self.setup_csv_logging()
@@ -662,6 +667,125 @@ class SmartBatteryMonitor:
                     GPIO.output(INVERTER_PIN, GPIO.LOW)
                 except:
                     pass
+    
+    def check_charging_failure(self, voltage):
+        """Detect if charger is connected but not actually charging during EV credit hours"""
+        if not CHARGING_FAILURE_DETECTION_ENABLED:
+            return
+        
+        now = datetime.now()
+        current_hour = now.hour
+        
+        # Only check during EV credit hours (midnight-6AM)
+        if not (0 <= current_hour < 6):
+            # Reset tracking when outside EV hours
+            self.ev_charging_start_time = None
+            self.ev_charging_start_voltage = None
+            return
+        
+        # Only check if voltage is below threshold (not already full)
+        if voltage >= CHARGING_FAILURE_MAX_VOLTAGE:
+            self.ev_charging_start_time = None
+            self.ev_charging_start_voltage = None
+            return
+        
+        # Only check if charger is supposed to be connected
+        if not self.charger_connected:
+            self.ev_charging_start_time = None
+            self.ev_charging_start_voltage = None
+            return
+        
+        # Start tracking if this is the first check during charging
+        if self.ev_charging_start_time is None:
+            self.ev_charging_start_time = time.time()
+            self.ev_charging_start_voltage = voltage
+            logging.info(f"🔋 Started tracking EV charging: {voltage:.2f}V at {now.strftime('%H:%M')}")
+            return
+        
+        # Check if enough time has passed
+        elapsed_minutes = (time.time() - self.ev_charging_start_time) / 60
+        if elapsed_minutes < CHARGING_FAILURE_CHECK_MINUTES:
+            return
+        
+        # Calculate voltage increase
+        voltage_increase = voltage - self.ev_charging_start_voltage
+        
+        # Check if voltage increased enough
+        if voltage_increase < CHARGING_FAILURE_MIN_VOLTAGE_INCREASE:
+            # Charging failure detected!
+            cooldown_period = timedelta(hours=1)
+            
+            # Only alert once per hour to avoid spam
+            if (self.last_charging_failure_alert is None or 
+                now - self.last_charging_failure_alert > cooldown_period):
+                
+                logging.warning(f"⚠️ CHARGING FAILURE DETECTED!")
+                logging.warning(f"   Start: {self.ev_charging_start_voltage:.2f}V at {datetime.fromtimestamp(self.ev_charging_start_time).strftime('%H:%M')}")
+                logging.warning(f"   Now:   {voltage:.2f}V at {now.strftime('%H:%M')}")
+                logging.warning(f"   Increase: {voltage_increase:.2f}V over {elapsed_minutes:.0f} minutes")
+                logging.warning(f"   Expected: >{CHARGING_FAILURE_MIN_VOLTAGE_INCREASE}V")
+                
+                # Send email alert
+                subject = f"⚠️ CHARGING FAILURE: Battery not charging during EV credit hours!"
+                message = f"""
+CHARGING FAILURE DETECTED!
+
+Your battery charger appears to be connected but NOT actually charging during the EV credit period (midnight-6AM).
+
+Charging Session Details:
+- Started: {datetime.fromtimestamp(self.ev_charging_start_time).strftime('%Y-%m-%d %H:%M:%S')}
+- Duration: {elapsed_minutes:.0f} minutes
+- Starting Voltage: {self.ev_charging_start_voltage:.2f}V
+- Current Voltage: {voltage:.2f}V
+- Voltage Increase: {voltage_increase:.2f}V
+- Expected Increase: >{CHARGING_FAILURE_MIN_VOLTAGE_INCREASE}V
+
+Current Status:
+- Charger Relay: {'Connected' if self.charger_connected else 'Disconnected'}
+- Time: {now.strftime('%H:%M')} (EV credit hours: midnight-6AM)
+- Solar: {'Active' if self.solar_detected else 'Inactive'}
+
+AUTOMATIC ACTIONS TAKEN:
+1. Performing inverter reset to attempt recovery
+2. This alert will not repeat for 1 hour
+
+Possible Causes:
+- Charger not plugged in or turned on
+- Charger malfunction or tripped breaker
+- Loose connection or bad cable
+- Shore power issue
+
+Recommended Actions:
+- Check if charger is physically connected and powered
+- Verify shore power is available
+- Check charger status lights/indicators
+- Inspect connections and cables
+- Consider manual charger reset
+
+This is valuable EV credit time being wasted - please investigate immediately!
+                """
+                
+                self.send_email_notification(subject, message, is_critical=True)
+                self.last_charging_failure_alert = now
+                
+                # Attempt recovery by resetting inverter
+                logging.info("🔄 Attempting recovery: Resetting inverter...")
+                try:
+                    GPIO.output(INVERTER_PIN, GPIO.HIGH)
+                    time.sleep(INVERTER_RESET_DURATION)
+                    GPIO.output(INVERTER_PIN, GPIO.LOW)
+                    logging.info("✅ Inverter reset complete")
+                except Exception as e:
+                    logging.error(f"❌ Inverter reset failed: {e}")
+            
+            # Reset tracking to check again in next cycle
+            self.ev_charging_start_time = None
+            self.ev_charging_start_voltage = None
+        else:
+            # Charging is working - log success and reset tracking for next check
+            logging.info(f"✅ EV charging verified: {voltage_increase:.2f}V increase over {elapsed_minutes:.0f} minutes")
+            self.ev_charging_start_time = None
+            self.ev_charging_start_voltage = None
     
     def _camping_mode_logic(self, voltage, threshold):
         """Simple camping logic with hysteresis"""
@@ -1541,6 +1665,9 @@ This alert will not repeat for 1 hour to avoid spam.
                     
                     # Control charger
                     self.control_charger(should_connect, reason)
+                    
+                    # Check for charging failure during EV credit hours
+                    self.check_charging_failure(voltage)
                     
                     # Log to CSV
                     self.log_to_csv(voltage, reason)

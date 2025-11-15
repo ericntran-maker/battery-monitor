@@ -38,7 +38,13 @@ DAILY_REBOOT_HOUR = 6          # Hour to perform daily reboot (24-hour format)
 INVERTER_RESET_ENABLED = True  # Enable daily inverter reset to prevent failures
 INVERTER_RESET_HOUR = 23       # Hour to perform inverter reset (24-hour format)
 INVERTER_RESET_MINUTE = 55     # Minute to perform inverter reset
-INVERTER_RESET_DURATION = 8    # Seconds to keep inverter off during reset
+INVERTER_RESET_DURATION = 12    # Seconds to keep inverter off during reset
+
+# Charging Failure Detection (during EV credit hours)
+CHARGING_FAILURE_DETECTION_ENABLED = True  # Detect if charger isn't working during EV hours
+CHARGING_FAILURE_CHECK_MINUTES = 30        # Minutes to wait before checking for voltage increase
+CHARGING_FAILURE_MIN_VOLTAGE_INCREASE = 0.15  # Minimum voltage increase expected (volts)
+CHARGING_FAILURE_MAX_VOLTAGE = 23.5        # Only check if voltage below this threshold
 
 # Evening charging thresholds
 EVENING_EV_WAIT_THRESHOLD = 20.9    # Wait for EV credit if voltage above this during evening hours

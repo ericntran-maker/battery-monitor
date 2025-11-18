@@ -43,7 +43,7 @@ INVERTER_RESET_DURATION = 12    # Seconds to keep inverter off during reset
 # Charging Failure Detection (during EV credit hours)
 CHARGING_FAILURE_DETECTION_ENABLED = True  # Detect if charger isn't working during EV hours
 CHARGING_FAILURE_CHECK_MINUTES = 30        # Minutes to wait before checking for voltage increase
-CHARGING_FAILURE_MIN_VOLTAGE_INCREASE = 0.15  # Minimum voltage increase expected (volts)
+CHARGING_FAILURE_MIN_VOLTAGE_INCREASE = 0.10  # Minimum voltage increase expected (volts)
 CHARGING_FAILURE_MAX_VOLTAGE = 23.5        # Only check if voltage below this threshold
 
 # Evening charging thresholds
@@ -55,7 +55,7 @@ EVENING_EV_WAIT_THRESHOLD = 20.9    # Wait for EV credit if voltage above this d
 # PREFERRED charging times (prioritize cheapest rates and solar)
 PREFERRED_CHARGING_HOURS = [
     (0, 6),    # Midnight - 6 AM (EV credit -$0.0150/kWh + off-peak rates) - CHEAPEST
-    (10, 17),  # 10 AM - 5 PM (solar generation window - avoid mid-peak when possible)
+    (9, 17),  # 10 AM - 5 PM (solar generation window - avoid mid-peak when possible)
     # Removed 8PM-midnight: Better to wait for EV credit period for cheaper rates
 ]
 
@@ -76,8 +76,8 @@ MONTHLY_SOLAR_PROFILE = {
     7:  {'name': 'Peak Summer',    'solar_factor': 1.00, 'daylight': (6, 20)},   # July - peak, still long days
     8:  {'name': 'Late Summer',    'solar_factor': 0.95, 'daylight': (7, 19)},   # August - excellent, days shortening
     9:  {'name': 'Early Fall',     'solar_factor': 0.80, 'daylight': (8, 18)},   # September - good, noticeably shorter
-    10: {'name': 'Mid Fall',       'solar_factor': 0.60, 'daylight': (10, 17)},   # October - declining, DST ends
-    11: {'name': 'Late Fall',      'solar_factor': 0.40, 'daylight': (10, 16)},   # November - poor, much shorter
+    10: {'name': 'Mid Fall',       'solar_factor': 0.60, 'daylight': (9, 17)},   # October - declining, DST ends
+    11: {'name': 'Late Fall',      'solar_factor': 0.40, 'daylight': (9, 16)},   # November - poor, much shorter
     12: {'name': 'Early Winter',   'solar_factor': 0.20, 'daylight': (10, 16)},   # December - worst, shortest days
 }
 

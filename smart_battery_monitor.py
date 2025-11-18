@@ -928,10 +928,19 @@ This is valuable EV credit time being wasted - please investigate immediately!
         if voltage > EMAIL_RECOVERY_VOLTAGE_THRESHOLD:  # 21.5V
             # Preferred charging hours (now only EV credit on weekends)
             if self.is_preferred_charging_time():
-                if voltage < NORMAL_VOLTAGE_THRESHOLD:  # 23.5V - Don't overcharge during preferred hours
-                    return True, "PREFERRED_HOURS"
+                # Add hysteresis to prevent toggling with LOW_VOLTAGE_CHARGED
+                if self.charger_connected:
+                    # Keep charging until 23.5V
+                    if voltage < NORMAL_VOLTAGE_THRESHOLD:  # 23.5V
+                        return True, "PREFERRED_HOURS"
+                    else:
+                        return False, "VOLTAGE_HIGH_SKIP_PREFERRED"
                 else:
-                    return False, "VOLTAGE_HIGH_SKIP_PREFERRED"
+                    # Only start charging if voltage dropped below 22.5V
+                    if voltage <= (LOW_VOLTAGE_PRIORITY_THRESHOLD + 1.8):  # 22.5V
+                        return True, "PREFERRED_HOURS"
+                    else:
+                        return False, "VOLTAGE_HIGH_SKIP_PREFERRED"
             
             # Daylight hours (potential solar) - charge if voltage reasonable (with hysteresis)
             start_hour, end_hour = self.get_monthly_daylight_hours()

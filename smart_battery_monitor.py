@@ -68,6 +68,11 @@ class SmartBatteryMonitor:
         self.ev_charging_start_voltage = None
         self.last_charging_failure_alert = None
         
+        # Internet connectivity health check tracking
+        self.last_internet_check = 0
+        self.consecutive_internet_failures = 0
+        self.last_internet_failure_alert = None
+        
         # CSV logging setup
         if ENABLE_CSV_LOGGING:
             self.setup_csv_logging()
@@ -786,6 +791,156 @@ This is valuable EV credit time being wasted - please investigate immediately!
             logging.info(f"✅ EV charging verified: {voltage_increase:.2f}V increase over {elapsed_minutes:.0f} minutes")
             self.ev_charging_start_time = None
             self.ev_charging_start_voltage = None
+    
+    def check_internet_connectivity(self):
+        """Check if Pi can communicate with the internet"""
+        import socket
+        
+        for host in INTERNET_CHECK_HOSTS:
+            try:
+                # Try to connect to the host on port 53 (DNS)
+                socket.setdefaulttimeout(INTERNET_CHECK_TIMEOUT)
+                socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, 53))
+                return True
+            except (socket.error, socket.timeout):
+                continue
+        
+        return False
+    
+    def check_internet_health(self):
+        """Monitor internet connectivity and reset Pi if connection is lost"""
+        if not INTERNET_HEALTH_CHECK_ENABLED:
+            return
+        
+        now = time.time()
+        
+        # Only check at specified intervals
+        if now - self.last_internet_check < INTERNET_CHECK_INTERVAL:
+            return
+        
+        self.last_internet_check = now
+        
+        # Check connectivity
+        is_connected = self.check_internet_connectivity()
+        
+        if is_connected:
+            # Connection successful - reset failure counter
+            if self.consecutive_internet_failures > 0:
+                logging.info(f"✅ Internet connectivity restored after {self.consecutive_internet_failures} failures")
+                self.consecutive_internet_failures = 0
+                self.last_internet_failure_alert = None
+        else:
+            # Connection failed
+            self.consecutive_internet_failures += 1
+            logging.warning(f"⚠️ Internet connectivity check failed ({self.consecutive_internet_failures}/{INTERNET_FAILURE_THRESHOLD})")
+            
+            # Send alert on first failure
+            if self.consecutive_internet_failures == 1:
+                current_time = datetime.now()
+                cooldown_period = timedelta(hours=1)
+                
+                # Only alert once per hour to avoid spam
+                if (self.last_internet_failure_alert is None or 
+                    current_time - self.last_internet_failure_alert > cooldown_period):
+                    
+                    subject = "⚠️ Internet Connectivity Issue - RV Battery Monitor"
+                    message = f"""
+Internet Connectivity Warning
+
+Your Raspberry Pi battery monitor is having trouble connecting to the internet.
+
+Status:
+- Consecutive failures: {self.consecutive_internet_failures}
+- Threshold for reset: {INTERNET_FAILURE_THRESHOLD}
+- Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}
+- Hosts checked: {', '.join(INTERNET_CHECK_HOSTS)}
+
+Action:
+- The system will continue monitoring
+- If {INTERNET_FAILURE_THRESHOLD} consecutive checks fail, the Pi will automatically reset
+- This helps recover from network issues that may prevent remote monitoring
+
+Battery Status:
+- Voltage: {self.last_voltage:.2f}V
+- Charger: {'Connected' if self.charger_connected else 'Disconnected'}
+- Solar: {'Active' if self.solar_detected else 'Inactive'}
+
+The system is still monitoring battery voltage and controlling the charger normally.
+                    """
+                    
+                    self.send_email_notification(subject, message)
+                    self.last_internet_failure_alert = current_time
+            
+            # Check if we've reached the threshold for reset
+            if self.consecutive_internet_failures >= INTERNET_FAILURE_THRESHOLD:
+                if INTERNET_RESET_ENABLED:
+                    self.reset_pi_for_internet_failure()
+                else:
+                    logging.error(f"❌ Internet connectivity lost for {INTERNET_FAILURE_THRESHOLD} consecutive checks, but auto-reset is disabled")
+    
+    def reset_pi_for_internet_failure(self):
+        """Reset the Raspberry Pi due to internet connectivity failure"""
+        import subprocess
+        import sys
+        
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logging.error(f"🔄 INTERNET CONNECTIVITY FAILURE: Resetting Pi at {current_time}")
+        logging.error(f"   Consecutive failures: {self.consecutive_internet_failures}")
+        logging.error(f"   Last successful check: {datetime.fromtimestamp(self.last_internet_check - (self.consecutive_internet_failures * INTERNET_CHECK_INTERVAL)).strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Log final system state
+        voltage = self.last_voltage
+        if voltage:
+            logging.info(f"📊 Final voltage reading: {voltage:.2f}V")
+            logging.info(f"🔌 Final charger state: {'Connected' if self.charger_connected else 'Disconnected'}")
+        
+        # Try to send email notification before reset
+        try:
+            subject = "🔄 CRITICAL: Pi Resetting Due to Internet Failure"
+            message = f"""
+CRITICAL: Raspberry Pi Reset Initiated
+
+Your Raspberry Pi battery monitor has lost internet connectivity and is performing an automatic reset to recover.
+
+Failure Details:
+- Consecutive failures: {self.consecutive_internet_failures}
+- Last successful check: {datetime.fromtimestamp(self.last_internet_check - (self.consecutive_internet_failures * INTERNET_CHECK_INTERVAL)).strftime('%Y-%m-%d %H:%M:%S')}
+- Reset time: {current_time}
+- Hosts checked: {', '.join(INTERNET_CHECK_HOSTS)}
+
+Battery Status at Reset:
+- Voltage: {voltage:.2f}V
+- Charger: {'Connected' if self.charger_connected else 'Disconnected'}
+- Solar: {'Active' if self.solar_detected else 'Inactive'}
+
+The Pi will reboot now and should restore connectivity.
+The battery monitoring system will resume automatically after reboot.
+
+If you continue to receive these alerts, there may be a persistent network issue that requires manual intervention.
+            """
+            
+            self.send_email_notification(subject, message, is_critical=True)
+        except Exception as e:
+            logging.error(f"Failed to send reset notification email: {e}")
+        
+        # Execute reboot
+        try:
+            logging.info("⏰ Executing system reboot NOW due to internet failure...")
+            # Flush all logs before reboot
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+            
+            # Execute reboot immediately
+            subprocess.run(['sudo', 'reboot'], check=False)
+            
+            # If we get here, reboot command was issued - exit the script
+            logging.info("✅ Reboot command issued, exiting script...")
+            sys.exit(0)
+            
+        except Exception as e:
+            logging.error(f"❌ Failed to execute reboot: {e}")
+            # Reset counter if reboot fails so we can try again later
+            self.consecutive_internet_failures = 0
     
     def _camping_mode_logic(self, voltage, threshold):
         """Simple camping logic with hysteresis"""
@@ -1630,6 +1785,7 @@ This alert will not repeat for 1 hour to avoid spam.
             logging.info(f"⏰ Preferred hours: {PREFERRED_CHARGING_HOURS}")
             logging.info(f"🚫 Peak avoid hours: {AVOID_CHARGING_HOURS}")
             logging.info(f"☀️ Solar detection: {'Enabled' if SOLAR_DETECTION_ENABLED else 'Disabled'}")
+            logging.info(f"🌐 Internet health check: {'Enabled' if INTERNET_HEALTH_CHECK_ENABLED else 'Disabled'} (Reset after {INTERNET_FAILURE_THRESHOLD} failures)")
             logging.info(f"📅 Current season: {self.get_monthly_season_name()} (Solar factor: {self.get_solar_factor():.0%}, Daylight: {self.get_monthly_daylight_hours()[0]}:00-{self.get_monthly_daylight_hours()[1]}:00)")
             
             # Show next camping period if any
@@ -1659,6 +1815,9 @@ This alert will not repeat for 1 hour to avoid spam.
                     
                     # Check for communication failures
                     self.check_communication_failure()
+                    
+                    # Check internet connectivity health
+                    self.check_internet_health()
                     
                     # Detect solar activity
                     self.detect_solar_charging()
@@ -1698,6 +1857,8 @@ This alert will not repeat for 1 hour to avoid spam.
                     logging.warning("Failed to read voltage - maintaining current state")
                     # Check for prolonged communication failures even when voltage read fails
                     self.check_communication_failure()
+                    # Check internet connectivity even when voltage read fails
+                    self.check_internet_health()
                     
                 time.sleep(MONITOR_INTERVAL)
                 

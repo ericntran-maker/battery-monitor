@@ -162,6 +162,18 @@ EMAIL_CRITICAL_HIGH_VOLTAGE_THRESHOLD = 25.0  # Send critical alert above 25.0V
 COMM_FAILURE_ALERT_MINUTES = 10      # Alert after 10 minutes of failed voltage reads
 COMM_FAILURE_CRITICAL_MINUTES = 30   # Critical alert after 30 minutes of failed reads
 
+# Internet connectivity health check
+INTERNET_HEALTH_CHECK_ENABLED = True  # Enable internet connectivity monitoring
+INTERNET_CHECK_INTERVAL = 300         # Check internet every 5 minutes (seconds)
+INTERNET_CHECK_TIMEOUT = 10           # Timeout for connectivity check (seconds)
+INTERNET_CHECK_HOSTS = [              # Hosts to check (will try in order until one succeeds)
+    "8.8.8.8",                        # Google DNS
+    "1.1.1.1",                        # Cloudflare DNS
+    "208.67.222.222",                 # OpenDNS
+]
+INTERNET_FAILURE_THRESHOLD = 3        # Number of consecutive failures before reset
+INTERNET_RESET_ENABLED = True         # Enable automatic Pi reset on internet failure
+
 # Email Configuration (you'll need to set these up)
 SMTP_SERVER = "smtp.gmail.com"           # Gmail SMTP server
 SMTP_PORT = 587                          # Gmail SMTP port

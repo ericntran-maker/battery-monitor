@@ -1053,7 +1053,9 @@ If you continue to receive these alerts, there may be a persistent network issue
                 return True, "LOW_VOLTAGE_PRIORITY"
         elif voltage >= (LOW_VOLTAGE_PRIORITY_THRESHOLD + 1.3) and self.charger_connected:  # 22.0V
             # Stop charging if voltage is high enough
-            return False, "LOW_VOLTAGE_CHARGED"
+            # BUT: Don't apply this during preferred hours - let that logic handle it
+            if not self.is_preferred_charging_time():
+                return False, "LOW_VOLTAGE_CHARGED"
         
         # Daily reboot to prevent system lockups
         # Check if it's the reboot hour (this will trigger once per day during the reboot hour)
@@ -1655,15 +1657,15 @@ Normal battery monitoring operation has resumed.
     
     def check_rapid_toggling(self):
         """Check if charger is toggling too rapidly and send alert"""
-        if len(self.charger_state_changes) < 3:
+        if len(self.charger_state_changes) < 4:
             return
         
-        # Check if we have 3+ toggles within 5 minutes (300 seconds)
+        # Check if we have 4+ toggles within 5 minutes (300 seconds)
         # With proper hysteresis, ANY rapid toggling indicates a logic problem
         now = time.time()
         recent_changes = [change for change in self.charger_state_changes if now - change[0] <= 300]
         
-        if len(recent_changes) >= 3:
+        if len(recent_changes) >= 4:
             # Rapid toggling detected!
             # Only send alert once per hour to avoid spam
             if self.last_rapid_toggle_alert is None or (now - self.last_rapid_toggle_alert) > 3600:

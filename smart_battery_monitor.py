@@ -73,6 +73,11 @@ class SmartBatteryMonitor:
         self.consecutive_internet_failures = 0
         self.last_internet_failure_alert = None
         
+        # Voltage stall detection tracking
+        self.voltage_stall_start_time = None
+        self.voltage_stall_start_voltage = None
+        self.last_voltage_stall_alert = None
+        
         # CSV logging setup
         if ENABLE_CSV_LOGGING:
             self.setup_csv_logging()
@@ -791,6 +796,96 @@ This is valuable EV credit time being wasted - please investigate immediately!
             logging.info(f"✅ EV charging verified: {voltage_increase:.2f}V increase over {elapsed_minutes:.0f} minutes")
             self.ev_charging_start_time = None
             self.ev_charging_start_voltage = None
+    
+    def detect_voltage_stall(self, voltage):
+        """Detect if voltage isn't increasing while charger is connected (anytime)"""
+        if not VOLTAGE_STALL_DETECTION_ENABLED:
+            return
+        
+        now = datetime.now()
+        
+        # Only check when charger is connected and voltage is below threshold
+        if not self.charger_connected or voltage >= VOLTAGE_STALL_MAX_VOLTAGE:
+            # Reset tracking when charger disconnected or battery nearly full
+            self.voltage_stall_start_time = None
+            self.voltage_stall_start_voltage = None
+            return
+        
+        # Start tracking if this is the first check during charging
+        if self.voltage_stall_start_time is None:
+            self.voltage_stall_start_time = time.time()
+            self.voltage_stall_start_voltage = voltage
+            logging.debug(f"📊 Started voltage stall tracking: {voltage:.2f}V")
+            return
+        
+        # Check if enough time has passed
+        elapsed_minutes = (time.time() - self.voltage_stall_start_time) / 60
+        if elapsed_minutes < VOLTAGE_STALL_CHECK_MINUTES:
+            return
+        
+        # Calculate voltage increase
+        voltage_increase = voltage - self.voltage_stall_start_voltage
+        
+        # Check if voltage increased enough
+        if voltage_increase < VOLTAGE_STALL_MIN_INCREASE:
+            # Voltage stall detected!
+            cooldown_period = timedelta(hours=VOLTAGE_STALL_COOLDOWN_HOURS)
+            
+            # Only alert once per cooldown period to avoid spam
+            if (self.last_voltage_stall_alert is None or 
+                now - self.last_voltage_stall_alert > cooldown_period):
+                
+                logging.warning(f"⚠️ VOLTAGE STALL DETECTED!")
+                logging.warning(f"   Start: {self.voltage_stall_start_voltage:.2f}V at {datetime.fromtimestamp(self.voltage_stall_start_time).strftime('%H:%M')}")
+                logging.warning(f"   Now:   {voltage:.2f}V at {now.strftime('%H:%M')}")
+                logging.warning(f"   Increase: {voltage_increase:.2f}V over {elapsed_minutes:.0f} minutes")
+                logging.warning(f"   Expected: >{VOLTAGE_STALL_MIN_INCREASE}V")
+                
+                # Send email notification (not critical - just informational)
+                subject = f"⚠️ Voltage Stall: Battery not charging ({voltage:.2f}V)"
+                message = f"""
+VOLTAGE STALL DETECTED
+
+Your battery charger is connected but voltage has not increased for {elapsed_minutes:.0f} minutes.
+
+Details:
+- Started Tracking: {datetime.fromtimestamp(self.voltage_stall_start_time).strftime('%Y-%m-%d %H:%M:%S')}
+- Duration: {elapsed_minutes:.0f} minutes
+- Starting Voltage: {self.voltage_stall_start_voltage:.2f}V
+- Current Voltage: {voltage:.2f}V
+- Voltage Change: {voltage_increase:+.2f}V
+- Expected Increase: >{VOLTAGE_STALL_MIN_INCREASE}V
+
+Current Status:
+- Charger Relay: Connected
+- Time: {now.strftime('%H:%M')}
+- Solar: {'Active' if self.solar_detected else 'Inactive'}
+
+Possible Causes:
+- Charger not plugged in or turned on
+- Charger malfunction or tripped breaker
+- Inverter issue (may need reset)
+- Shore power issue
+- Battery near full (false positive if voltage >{VOLTAGE_STALL_MAX_VOLTAGE}V)
+
+You may want to:
+- Check charger connections
+- Consider running: python3 test_inverter_reset.py
+
+This notification will not repeat for {VOLTAGE_STALL_COOLDOWN_HOURS} hours.
+                """
+                
+                self.send_email_notification(subject, message, is_critical=False)
+                self.last_voltage_stall_alert = now
+            
+            # Reset tracking to check again in next cycle
+            self.voltage_stall_start_time = None
+            self.voltage_stall_start_voltage = None
+        else:
+            # Charging is working - reset tracking for next check
+            logging.debug(f"✅ Charging verified: {voltage_increase:.2f}V increase over {elapsed_minutes:.0f} minutes")
+            self.voltage_stall_start_time = None
+            self.voltage_stall_start_voltage = None
     
     def check_internet_connectivity(self):
         """Check if Pi can communicate with the internet"""
@@ -1838,6 +1933,9 @@ This alert will not repeat for 1 hour to avoid spam.
                     
                     # Check for charging failure during EV credit hours
                     self.check_charging_failure(voltage)
+                    
+                    # Check for voltage stall (anytime charger is connected)
+                    self.detect_voltage_stall(voltage)
                     
                     # Log to CSV
                     self.log_to_csv(voltage, reason)

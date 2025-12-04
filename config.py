@@ -46,6 +46,13 @@ CHARGING_FAILURE_CHECK_MINUTES = 30        # Minutes to wait before checking for
 CHARGING_FAILURE_MIN_VOLTAGE_INCREASE = 0.10  # Minimum voltage increase expected (volts)
 CHARGING_FAILURE_MAX_VOLTAGE = 23.5        # Only check if voltage below this threshold
 
+# Voltage Stall Detection (anytime charger is connected)
+VOLTAGE_STALL_DETECTION_ENABLED = True     # Detect if voltage isn't increasing while charging
+VOLTAGE_STALL_CHECK_MINUTES = 30           # Minutes to wait before checking for voltage increase
+VOLTAGE_STALL_MIN_INCREASE = 0.05          # Minimum voltage increase expected (volts)
+VOLTAGE_STALL_MAX_VOLTAGE = 24.5           # Only check if voltage below this (near full = no increase expected)
+VOLTAGE_STALL_COOLDOWN_HOURS = 2           # Hours between stall notifications
+
 # Evening charging thresholds
 EVENING_EV_WAIT_THRESHOLD = 20.9    # Wait for EV credit if voltage above this during evening hours
 

@@ -621,6 +621,14 @@ class SmartBatteryMonitor:
             logging.info(f"📊 Final voltage reading: {voltage:.2f}V")
             logging.info(f"🔌 Final charger state: {'Connected' if self.charger_connected else 'Disconnected'}")
         
+        # Write reboot reason to file so we can report it on startup
+        try:
+            reboot_reason_file = os.path.join(os.path.dirname(LOG_FILE), 'last_reboot_reason.txt')
+            with open(reboot_reason_file, 'w') as f:
+                f.write(f"daily_reboot|{current_time}")
+        except Exception as e:
+            logging.warning(f"Failed to write reboot reason: {e}")
+        
         # Schedule reboot immediately (now instead of +1 minute)
         try:
             logging.info("⏰ Executing system reboot NOW...")
@@ -980,6 +988,14 @@ The system is still monitoring battery voltage and controlling the charger norma
         
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logging.error(f"🔄 INTERNET CONNECTIVITY FAILURE: Resetting Pi at {current_time}")
+        
+        # Write reboot reason to file so we can report it on startup
+        try:
+            reboot_reason_file = os.path.join(os.path.dirname(LOG_FILE), 'last_reboot_reason.txt')
+            with open(reboot_reason_file, 'w') as f:
+                f.write(f"internet_failure|{current_time}|{self.consecutive_internet_failures}|{self.last_voltage:.2f}")
+        except Exception as e:
+            logging.warning(f"Failed to write reboot reason: {e}")
         logging.error(f"   Consecutive failures: {self.consecutive_internet_failures}")
         logging.error(f"   Last successful check: {datetime.fromtimestamp(self.last_internet_check - (self.consecutive_internet_failures * INTERNET_CHECK_INTERVAL)).strftime('%Y-%m-%d %H:%M:%S')}")
         
@@ -1036,6 +1052,137 @@ If you continue to receive these alerts, there may be a persistent network issue
             logging.error(f"❌ Failed to execute reboot: {e}")
             # Reset counter if reboot fails so we can try again later
             self.consecutive_internet_failures = 0
+    
+    def send_startup_notification(self):
+        """Send email notification when the monitor starts up"""
+        if not EMAIL_NOTIFICATIONS_ENABLED:
+            return
+        
+        # Wait for internet connectivity before sending email
+        max_wait_seconds = 60
+        wait_interval = 5
+        waited = 0
+        while waited < max_wait_seconds:
+            if self.check_internet_connectivity():
+                logging.info(f"✅ Internet connectivity confirmed after {waited}s")
+                break
+            logging.info(f"⏳ Waiting for internet connectivity... ({waited}/{max_wait_seconds}s)")
+            time.sleep(wait_interval)
+            waited += wait_interval
+        else:
+            logging.warning("⚠️ Internet not available after 60s, attempting to send email anyway")
+        
+        # Check system uptime to determine if this was a recent reboot
+        try:
+            with open('/proc/uptime', 'r') as f:
+                uptime_seconds = float(f.readline().split()[0])
+        except:
+            uptime_seconds = None
+        
+        # Check for reboot reason file
+        reboot_reason = None
+        reboot_reason_file = os.path.join(os.path.dirname(LOG_FILE), 'last_reboot_reason.txt')
+        try:
+            if os.path.exists(reboot_reason_file):
+                with open(reboot_reason_file, 'r') as f:
+                    reboot_reason = f.read().strip()
+                # Delete the file after reading
+                os.remove(reboot_reason_file)
+        except Exception as e:
+            logging.warning(f"Failed to read reboot reason: {e}")
+        
+        # Get initial voltage reading
+        voltage = self.read_voltage()
+        voltage_str = f"{voltage:.2f}V" if voltage else "Unable to read"
+        
+        now = datetime.now()
+        
+        # Parse reboot reason if available
+        reboot_details = ""
+        if reboot_reason:
+            try:
+                parts = reboot_reason.split('|')
+                reason_type = parts[0]
+                reason_time = parts[1] if len(parts) > 1 else "Unknown"
+                
+                if reason_type == "internet_failure":
+                    failures = parts[2] if len(parts) > 2 else "Unknown"
+                    last_voltage = parts[3] if len(parts) > 3 else "Unknown"
+                    subject = "🔄 Battery Monitor Recovered from Internet Failure Reboot"
+                    reboot_details = f"""
+Reboot Reason: INTERNET CONNECTIVITY FAILURE
+- Reboot initiated at: {reason_time}
+- Consecutive failures before reboot: {failures}
+- Voltage at reboot: {last_voltage}V
+"""
+                elif reason_type == "daily_reboot":
+                    subject = "🔄 Battery Monitor Recovered from Daily Maintenance Reboot"
+                    reboot_details = f"""
+Reboot Reason: DAILY MAINTENANCE REBOOT
+- Reboot initiated at: {reason_time}
+"""
+                else:
+                    subject = "🔄 Battery Monitor Restarted"
+                    reboot_details = f"\nReboot Reason: {reason_type}\n"
+            except:
+                subject = "🔄 Battery Monitor Restarted"
+                reboot_details = f"\nReboot Reason: {reboot_reason}\n"
+        elif uptime_seconds and uptime_seconds < 300:
+            subject = "🔄 Battery Monitor Restarted (Recent Reboot)"
+            reboot_details = "\nReboot Reason: Unknown (no reason file found, but system recently rebooted)\n"
+        else:
+            subject = "✅ Battery Monitor Started"
+        
+        # Format uptime
+        if uptime_seconds:
+            if uptime_seconds < 300:
+                reboot_info = f"System uptime: {int(uptime_seconds)} seconds"
+            else:
+                reboot_info = f"System uptime: {int(uptime_seconds / 3600)}h {int((uptime_seconds % 3600) / 60)}m"
+        else:
+            reboot_info = "System uptime: Unknown"
+        
+        message = f"""
+Battery Monitor Service Started
+
+Your RV battery monitor has started successfully.
+{reboot_details}
+Startup Details:
+- Time: {now.strftime('%Y-%m-%d %H:%M:%S')}
+- {reboot_info}
+- Initial Voltage: {voltage_str}
+- Charger State: {'Connected' if self.charger_connected else 'Disconnected'}
+
+System Configuration:
+- Battery Capacity: {BATTERY_CAPACITY_KWH}kWh
+- Inverter Cutoff: {INVERTER_CUTOFF_VOLTAGE}V
+- Internet Health Check: {'Enabled' if INTERNET_HEALTH_CHECK_ENABLED else 'Disabled'}
+- Daily Inverter Reset: {'Enabled at ' + str(INVERTER_RESET_HOUR) + ':' + str(INVERTER_RESET_MINUTE).zfill(2) if INVERTER_RESET_ENABLED else 'Disabled'}
+
+If this startup was unexpected, check the logs at:
+{LOG_FILE}
+
+The system is now monitoring your battery.
+        """
+        
+        # Try to send email with retries
+        max_retries = 3
+        retry_delay = 60
+        for attempt in range(max_retries):
+            try:
+                success = self.send_email_notification(subject, message, is_critical=False)
+                if success:
+                    logging.info("📧 Startup notification email sent")
+                    break
+                else:
+                    raise Exception("send_email_notification returned False")
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logging.warning(f"Failed to send startup notification (attempt {attempt + 1}/{max_retries}): {e}")
+                    logging.info(f"⏳ Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    logging.warning(f"Failed to send startup notification after {max_retries} attempts: {e}")
     
     def _camping_mode_logic(self, voltage, threshold):
         """Simple camping logic with hysteresis"""
@@ -1847,6 +1994,9 @@ This alert will not repeat for 1 hour to avoid spam.
         
     def monitor_loop(self):
         """Main monitoring loop with smart charging logic"""
+        
+        # Send startup notification
+        self.send_startup_notification()
         
         # Check camping mode status
         is_camping, camping_voltage = self.is_camping_period()
